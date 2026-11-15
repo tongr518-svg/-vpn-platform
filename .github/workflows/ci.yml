@@ -26,6 +26,7 @@ jobs:
 
     env:
       TEST_DATABASE_URL: postgres://vpn_test:test-password@localhost:5432/vpn_test?sslmode=disable
+      REQUIRE_INTEGRATION_TESTS: "1"
 
     steps:
       - name: Checkout
@@ -38,16 +39,28 @@ jobs:
           cache: true
 
       - name: Check formatting
-        run: test -z "$(gofmt -l ./cmd/api)"
+        shell: bash
+        run: |
+          files="$(find ./cmd -type f -name '*.go' -print0 | xargs -0 gofmt -l)"
+          if [ -n "$files" ]; then
+            echo "$files"
+            exit 1
+          fi
 
-      - name: Verify dependencies
-        run: go mod tidy && git diff --exit-code -- go.mod go.sum
+      - name: Resolve dependencies
+        run: go mod tidy
+
+      - name: Ensure dependency files are tidy
+        run: git diff --exit-code -- go.mod go.sum
 
       - name: Vet
         run: go vet ./...
 
       - name: Test
         run: go test ./...
+
+      - name: Race detector
+        run: go test -race ./...
 
   client:
     name: Flutter checks
@@ -70,7 +83,10 @@ jobs:
         run: flutter pub get
 
       - name: Check formatting
-        run: dart format --output=none --set-exit-if-changed lib
+        run: dart format --output=none --set-exit-if-changed lib test
 
       - name: Analyze
         run: flutter analyze
+
+      - name: Test
+        run: flutter test
