@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VPN 管理后台</title>
+  <style>
+    :root { color-scheme: light; font: 15px system-ui, sans-serif; color: #172033; background: #f4f6fa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 1100px; margin: 32px auto; padding: 0 18px; }
+    section { background: #fff; border: 1px solid #e3e7ef; border-radius: 10px; padding: 18px; margin: 16px 0; overflow-x: auto; }
+    h1 { font-size: 25px; }
+    h2 { margin-top: 0; font-size: 19px; }
+    input, select, button { padding: 9px 10px; margin: 4px; border: 1px solid #cbd2df; border-radius: 6px; }
+    button { cursor: pointer; background: #eef3ff; }
+    button.primary { background: #2458d3; color: #fff; border-color: #2458d3; }
+    button.danger { color: #a21d2d; }
+    button:disabled { cursor: wait; opacity: .65; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; white-space: nowrap; }
+    th, td { padding: 9px; text-align: left; border-bottom: 1px solid #e8ebf1; }
+    .row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .muted { color: #657087; }
+    #message { min-height: 1.4em; white-space: pre-wrap; }
+    #message.error { color: #a21d2d; }
+    [hidden] { display: none !important; }
+    @media (max-width: 600px) {
+      main { margin: 18px auto; padding: 0 10px; }
+      section { padding: 14px; }
+      input, select { max-width: 100%; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>VPN 管理后台</h1>
+  <p class="muted">管理用户、套餐和手动订阅。此页面不控制 VPN 隧道。</p>
+  <p id="message" role="status" aria-live="polite"></p>
+
+  <section id="loginPanel">
+    <h2>管理员登录</h2>
+    <form id="loginForm" class="row">
+      <input id="email" type="email" placeholder="邮箱" autocomplete="username" required>
+      <input id="password" type="password" placeholder="密码" autocomplete="current-password" required>
+      <button class="primary">登录</button>
+    </form>
+  </section>
+
+  <div id="dashboard" hidden>
+    <section>
+      <div class="row">
+        <h2 style="flex:1">用户</h2>
+        <button id="refreshUsers" type="button">刷新</button>
+        <button id="logout" type="button">退出登录</button>
+      </div>
+      <table>
+        <thead><tr><th>ID</th><th>邮箱</th><th>角色</th><th>状态</th><th>注册时间</th><th>操作</th></tr></thead>
+        <tbody id="usersBody"></tbody>
+      </table>
+    </section>
+
+    <section id="devicePanel" hidden>
+      <div class="row">
+        <h2 id="deviceTitle" style="flex:1">用户设备</h2>
+        <button id="closeDevicePanel" type="button">关闭</button>
+      </div>
+      <table>
+        <thead><tr><th>ID</th><th>名称</th><th>平台</th><th>登记时间</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="devicesBody"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <div class="row">
+        <h2 style="flex:1">套餐</h2>
+        <button id="refreshPlans" type="button">刷新</button>
+      </div>
+      <form id="planForm" class="row">
+        <input id="planName" placeholder="套餐名称" maxlength="80" required>
+        <input id="deviceLimit" type="number" min="1" value="2" title="设备数限制" required>
+        <input id="concurrentLimit" type="number" min="1" value="1" title="并发连接数" required>
+        <input id="dataLimit" type="number" min="0" value="0" title="流量限制（字节，0=不限）">
+        <input id="speedLimit" type="number" min="0" value="0" title="速度限制 Mbps，0=不限">
+        <button class="primary">创建套餐</button>
+      </form>
+      <p class="muted">流量和速度限制目前只记录，不会实际限速或断流。</p>
+      <table>
+        <thead><tr><th>ID</th><th>名称</th><th>设备数</th><th>并发数</th><th>流量字节</th><th>速度 Mbps</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="plansBody"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>手动开通订阅</h2>
+      <form id="subscriptionForm" class="row">
+        <input id="subscriptionUserId" type="number" min="1" placeholder="用户 ID" required>
+        <select id="subscriptionPlan" required>
+          <option value="">选择有效套餐</option>
+        </select>
+        <label>开始 <input id="startsAt" type="datetime-local" required></label>
+        <label>结束 <input id="endsAt" type="datetime-local" required></label>
+        <button class="primary">开通订阅</button>
+      </form>
+    </section>
+
+    <section>
+      <div class="row">
+        <h2 style="flex:1">订阅记录</h2>
+        <button id="refreshSubscriptions" type="button">刷新</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th>ID</th><th>用户</th><th>套餐</th><th>状态</th><th>开始时间</th><th>结束时间</th><th>操作</th></tr>
+        </thead>
+        <tbody id="subscriptionsBody"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <div class="row">
+        <h2 style="flex:1">管理员操作记录</h2>
+        <button id="refreshAuditLogs" type="button">刷新</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th>时间</th><th>管理员</th><th>操作</th><th>目标类型</th><th>目标 ID</th></tr>
+        </thead>
+        <tbody id="auditLogsBody"></tbody>
+      </table>
+    </section>
+  </div>
+</main>
+
+<script>
+(() => {
+  "use strict";
+  const tokenKey = "vpn_admin_token";
+  const $ = id => document.getElementById(id);
+  const token = () => sessionStorage.getItem(tokenKey);
+  const message = (text, isError = false) => {
+    $("message").textContent = text || "";
+    $("message").classList.toggle("error", isError);
+  };
+
+  async function api(path, options = {}) {
+    const headers = new Headers(options.headers || {});
+    if (options.body) headers.set("Content-Type", "application/json");
+    if (token()) headers.set("Authorization", "Bearer " + token());
+
+    const response = await fetch(path, { ...options, headers });
+    if (response.status === 204) return null;
+    const text = await response.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch {}
+    if (!response.ok) {
+      const error = new Error(body?.error || `请求失败 (${response.status})`);
+      error.status = response.status;
+      throw error;
+    }
+    return body;
+  }
+
+  function cell(row, value) {
+    const td = document.createElement("td");
+    td.textContent = value == null ? "" : String(value);
+    row.appendChild(td);
+    return td;
+  }
+
+  function dateText(value) {
+    return value ? new Date(value).toLocaleString() : "";
+  }
+
+  function handleAuthError(error) {
+    if (error.status === 401 || error.status === 403) {
+      sessionStorage.removeItem(tokenKey);
+      showLogin();
+    }
+    message(error.message, true);
+  }
+
+  async function loadUsers() {
+    const users = await api("/v1/admin/users");
+    const body = $("usersBody");
+    body.replaceChildren();
+    for (const user of users) {
+      const tr = document.createElement("tr");
+      cell(tr, user.id);
+      cell(tr, user.email);
+      cell(tr, user.role);
+      cell(tr, user.status);
+      cell(tr, dateText(user.created_at));
+      const td = document.createElement("td");
+      const button = document.createElement("button");
+      button.textContent = user.status === "active" ? "暂停" : "恢复";
+      button.className = user.status === "active" ? "danger" : "";
+      button.disabled = user.role === "admin";
+      button.title = button.disabled ? "管理员账号不在此处修改" : "";
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          const nextStatus = user.status === "active" ? "suspended" : "active";
+          await api(`/v1/admin/users/${user.id}/status`, {
+            method: "PATCH",
+            body: JSON.stringify({ status: nextStatus })
+          });
+          message(`用户 ${user.id} 状态已更新`);
+          await loadUsers();
+        } catch (error) { handleAuthError(error); }
+        finally { button.disabled = false; }
+      });
+      td.appendChild(button);
+
+      const devicesButton = document.createElement("button");
+      devicesButton.textContent = "设备";
+      devicesButton.addEventListener("click", () => loadUserDevices(user));
+      td.appendChild(devicesButton);
+
+      tr.appendChild(td);
+      body.appendChild(tr);
+    }
+  }
+
+  async function loadUserDevices(user) {
+    $("deviceTitle").textContent = `用户设备：${user.email}（ID ${user.id}）`;
+    $("devicePanel").hidden = false;
+    const body = $("devicesBody");
+    body.replaceChildren();
+
+    try {
+      const devices = await api(`/v1/admin/users/${user.id}/devices`);
+      if (devices.length === 0) {
+        const tr = document.createElement("tr");
+        const td = cell(tr, "暂无设备");
+        td.colSpan = 6;
+        body.appendChild(tr);
+        return;
+      }
+      for (const device of devices) {
+        const tr = document.createElement("tr");
+        cell(tr, device.id);
+        cell(tr, device.name);
+        cell(tr, device.platform);
+        cell(tr, dateText(device.created_at));
+        cell(tr, device.revoked ? "已撤销" : "有效");
+        const td = document.createElement("td");
+        if (!device.revoked) {
+          const button = document.createElement("button");
+          button.textContent = "撤销设备";
+          button.className = "danger";
+          button.addEventListener("click", async () => {
+            if (!confirm(`确定撤销设备“${device.name}”吗？`)) return;
+            button.disabled = true;
+            try {
+              await api(`/v1/admin/users/${user.id}/devices/${device.id}`, { method: "DELETE" });
+              message("设备已撤销");
+              await loadUserDevices(user);
+            } catch (error) { handleAuthError(error); }
+            finally { button.disabled = false; }
+          });
+          td.appendChild(button);
+        }
+        tr.appendChild(td);
+        body.appendChild(tr);
+      }
+    } catch (error) { handleAuthError(error); }
+  }
+
+  async function loadPlans() {
+    const plans = await api("/v1/admin/plans");
+    const body = $("plansBody");
+    const select = $("subscriptionPlan");
+    body.replaceChildren();
+    select.replaceChildren(new Option("选择有效套餐", ""));
+    for (const plan of plans) {
+      const tr = document.createElement("tr");
+      cell(tr, plan.id);
+      cell(tr, plan.name);
+      cell(tr, plan.device_limit);
+      cell(tr, plan.concurrent_limit);
+      cell(tr, plan.data_limit_bytes || "不限");
+      cell(tr, plan.speed_limit_mbps || "不限");
+      cell(tr, plan.active ? "有效" : "停用");
+      const td = document.createElement("td");
+      const button = document.createElement("button");
+      button.textContent = plan.active ? "停用" : "启用";
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          await api(`/v1/admin/plans/${plan.id}/status`, {
+            method: "PATCH",
+            body: JSON.stringify({ active: !plan.active })
+          });
+          message(`套餐 ${plan.id} 状态已更新`);
+          await loadPlans();
+        } catch (error) { handleAuthError(error); }
+        finally { button.disabled = false; }
+      });
+      td.appendChild(button);
+      tr.appendChild(td);
+      body.appendChild(tr);
+      if (plan.active) select.add(new Option(`${plan.name}（ID ${plan.id}）`, String(plan.id)));
+    }
+  }
+
+  async function loadSubscriptions() {
+    const subscriptions = await api("/v1/admin/subscriptions");
+    const body = $("subscriptionsBody");
+    body.replaceChildren();
+
+    for (const subscription of subscriptions) {
+      const tr = document.createElement("tr");
+      cell(tr, subscription.id);
+      cell(tr, `${subscription.email}（ID ${subscription.user_id}）`);
+      cell(tr, subscription.plan_name);
+      cell(tr, subscription.status);
+      cell(tr, dateText(subscription.starts_at));
+      cell(tr, dateText(subscription.ends_at));
+
+      const td = document.createElement("td");
+      if (subscription.status === "active") {
+        const button = document.createElement("button");
+        button.textContent = "取消订阅";
+        button.className = "danger";
+        button.addEventListener("click", async () => {
+          if (!confirm(`确定取消订阅 #${subscription.id} 吗？`)) return;
+          button.disabled = true;
+          try {
+            await api(`/v1/admin/subscriptions/${subscription.id}/cancel`, { method: "POST" });
+            message("订阅已取消");
+            await loadSubscriptions();
+          } catch (error) { handleAuthError(error); }
+          finally { button.disabled = false; }
+        });
+        td.appendChild(button);
+      }
+      tr.appendChild(td);
+      body.appendChild(tr);
+    }
+  }
+
+  async function loadAuditLogs() {
+    const logs = await api("/v1/admin/audit-logs");
+    const body = $("auditLogsBody");
+    body.replaceChildren();
+    for (const item of logs) {
+      const tr = document.createElement("tr");
+      cell(tr, dateText(item.created_at));
+      cell(tr, item.actor_email || `用户 ID ${item.actor_user_id ?? "—"}`);
+      cell(tr, item.action);
+      cell(tr, item.target_type);
+      cell(tr, item.target_id ?? "");
+      body.appendChild(tr);
+    }
+  }
+
+  async function refresh() {
+    try {
+      await Promise.all([loadUsers(), loadPlans(), loadSubscriptions(), loadAuditLogs()]);
+      message("数据已刷新");
+    } catch (error) { handleAuthError(error); }
+  }
+
+  function showLogin() {
+    $("loginPanel").hidden = false;
+    $("dashboard").hidden = true;
+  }
+
+  function showDashboard() {
+    $("loginPanel").hidden = true;
+    $("dashboard").hidden = false;
+    refresh();
+  }
+
+  $("loginForm").addEventListener("submit", async event => {
+    event.preventDefault();
+    message("");
+    try {
+      const result = await api("/v1/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ email: $("email").value, password: $("password").value })
+      });
+      sessionStorage.setItem(tokenKey, result.token);
+      showDashboard();
+    } catch (error) { message(error.message, true); }
+  });
+
+  $("logout").addEventListener("click", () => {
+    sessionStorage.removeItem(tokenKey);
+    showLogin();
+    message("已退出");
+  });
+  $("closeDevicePanel").addEventListener("click", () => {
+    $("devicePanel").hidden = true;
+  });
+  $("refreshUsers").addEventListener("click", () => loadUsers().catch(handleAuthError));
+  $("refreshPlans").addEventListener("click", () => loadPlans().catch(handleAuthError));
+  $("refreshSubscriptions").addEventListener(
+    "click",
+    () => loadSubscriptions().catch(handleAuthError)
+  );
+  $("refreshAuditLogs").addEventListener(
+    "click",
+    () => loadAuditLogs().catch(handleAuthError)
+  );
+
+  $("planForm").addEventListener("submit", async event => {
+    event.preventDefault();
+    try {
+      await api("/v1/admin/plans", {
+        method: "POST",
+        body: JSON.stringify({
+          name: $("planName").value.trim(),
+          device_limit: Number($("deviceLimit").value),
+          concurrent_limit: Number($("concurrentLimit").value),
+          data_limit_bytes: Number($("dataLimit").value),
+          speed_limit_mbps: Number($("speedLimit").value)
+        })
+      });
+      $("planForm").reset();
+      message("套餐已创建");
+      await loadPlans();
+    } catch (error) { handleAuthError(error); }
+  });
+
+  $("subscriptionForm").addEventListener("submit", async event => {
+    event.preventDefault();
+    try {
+      const userId = Number($("subscriptionUserId").value);
+      const planId = Number($("subscriptionPlan").value);
+      const startsAt = new Date($("startsAt").value).toISOString();
+      const endsAt = new Date($("endsAt").value).toISOString();
+      await api(`/v1/admin/users/${userId}/subscriptions`, {
+        method: "POST",
+        body: JSON.stringify({ plan_id: planId, starts_at: startsAt, ends_at: endsAt })
+      });
+      message("订阅已开通");
+      $("subscriptionForm").reset();
+      await loadPlans();
+      await loadSubscriptions();
+    } catch (error) { handleAuthError(error); }
+  });
+
+  if (token()) showDashboard();
+})();
+</script>
+</body>
+</html>

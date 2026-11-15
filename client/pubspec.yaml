@@ -1,0 +1,22 @@
+name: vpn_platform_client
+description: Shared VPN platform account and device management client.
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  cryptography: ^2.9.0
+  flutter:
+    sdk: flutter
+  flutter_secure_storage: ^10.3.4
+  http: ^1.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
