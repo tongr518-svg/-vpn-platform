@@ -119,7 +119,7 @@ func loadNodeConfigSnapshot(ctx context.Context, tx pgx.Tx, nodeID, version int6
 	}
 	rows, err := tx.Query(ctx,
 		`SELECT d.id, d.public_key, d.platform, a.assigned_at,
-		        COALESCE(ta.address::text, ''), d.revoked_at IS NOT NULL
+		        COALESCE(host(ta.address), ''), d.revoked_at IS NOT NULL
 		 FROM node_device_assignments a
 		 JOIN devices d ON d.id = a.device_id
 		 LEFT JOIN node_tunnel_addresses ta
