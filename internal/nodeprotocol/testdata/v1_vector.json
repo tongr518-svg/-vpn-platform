@@ -1,0 +1,31 @@
+{
+  "snapshot": {
+    "node_id": 42,
+    "version": 7,
+    "tunnel_cidr": "10.77.0.0/24",
+    "gateway_address": "10.77.0.1",
+    "devices": [
+      {
+        "device_id": 9,
+        "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "platform": "windows",
+        "assigned_at": "2025-01-02T03:04:05Z",
+        "tunnel_address": "10.77.0.2"
+      }
+    ]
+  },
+  "canonical_snapshot": "vpn-platform-node-config-snapshot-v1\nnode_id=42\nversion=7\ntunnel_cidr=MTAuNzcuMC4wLzI0\ngateway_address=MTAuNzcuMC4x\npeer=9\tQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQT0\twindows\t2025-01-02T03:04:05Z\t10.77.0.2\n",
+  "snapshot_digest": "4a012dde4d23d207df55819b8d6d5fca29df4ed8ff2412229e9e506dfcef8391",
+  "approval": {
+    "approval_id": 123,
+    "node_id": 42,
+    "candidate_version": 7,
+    "candidate_digest": "4a012dde4d23d207df55819b8d6d5fca29df4ed8ff2412229e9e506dfcef8391",
+    "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "signature": "3awOp1MZaBaz4H2rT1WH7xCynEx5/76sAe4WaNURRWPzy45PMBROhl7dvCpKT+6TInvz1Oo9pg9gllhSJqogAQ==",
+    "issued_at": "2025-01-02T03:04:05Z",
+    "expires_at": "2025-01-02T03:14:05Z"
+  },
+  "approval_message": "vpn-platform-node-config-approval-v1\n42\n7\n4a012dde4d23d207df55819b8d6d5fca29df4ed8ff2412229e9e506dfcef8391\n1735787045\n1735787645\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "public_key": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+}

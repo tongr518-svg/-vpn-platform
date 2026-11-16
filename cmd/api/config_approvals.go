@@ -5,14 +5,13 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"vpn-platform/internal/nodeprotocol"
 )
 
 const configApprovalLifetime = 10 * time.Minute
@@ -21,16 +20,7 @@ type approveNodeConfigRequest struct {
 	CandidateVersion int64 `json:"candidate_version"`
 }
 
-type nodeConfigApproval struct {
-	ID               int64     `json:"approval_id"`
-	NodeID           int64     `json:"node_id"`
-	CandidateVersion int64     `json:"candidate_version"`
-	CandidateDigest  string    `json:"candidate_digest"`
-	Nonce            string    `json:"nonce"`
-	Signature        string    `json:"signature"`
-	IssuedAt         time.Time `json:"issued_at"`
-	ExpiresAt        time.Time `json:"expires_at"`
-}
+type nodeConfigApproval = nodeprotocol.Approval
 
 type verifyNodeApprovalRequest struct {
 	Approval nodeConfigApproval `json:"approval"`
@@ -50,23 +40,11 @@ func deriveConfigSigningKey(secret string) (ed25519.PrivateKey, error) {
 }
 
 func candidateSnapshotDigest(snapshot nodeConfigSnapshot) (string, error) {
-	encoded, err := json.Marshal(snapshot)
-	if err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256(encoded)
-	return hex.EncodeToString(digest[:]), nil
+	return nodeprotocol.SnapshotDigest(snapshot), nil
 }
 
 func approvalMessage(approval nodeConfigApproval) []byte {
-	return []byte(fmt.Sprintf("vpn-platform-node-config-approval-v1\n%d\n%d\n%s\n%d\n%d\n%s",
-		approval.NodeID,
-		approval.CandidateVersion,
-		approval.CandidateDigest,
-		approval.IssuedAt.UTC().Unix(),
-		approval.ExpiresAt.UTC().Unix(),
-		approval.Nonce,
-	))
+	return nodeprotocol.ApprovalMessage(approval)
 }
 
 func (a *API) adminApproveNodeConfig(w http.ResponseWriter, r *http.Request) {

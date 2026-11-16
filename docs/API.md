@@ -117,11 +117,30 @@ JWT 有效期为 12 小时。账号暂停或 `token_version` 变化后，旧 JWT
 
 Agent 可用 `POST /v1/node/config/dry-run` 提交 `{"confirmed_snapshot": <此前已确认的完整快照>}`。服务端确认基线版本等于当前已确认版本，再以当前期望快照作为候选输入进行纯元数据规划；响应包含 `added`、`changed`、`removed` peer 列表及地址池变化。验证失败返回 `422 dry_run_validation_failed`，不返回候选计划。相同版本、相同快照得到稳定结果；候选版本低于基线、快照结构/地址无效、地址冲突、仍含已撤销设备或同版本内容不一致都会被拒绝。计划只含设备 ID、公钥和地址等公开 peer 元数据，没有 WireGuard 私钥或可直接应用的配置文本。
 
-管理员节点列表仅显示最近一次 dry-run 的基线/候选版本、差异计数、校验状态和错误摘要。dry-run 保存由候选快照规范化 JSON 计算的 SHA-256 摘要；摘要不包含私钥。
+管理员节点列表仅显示最近一次 dry-run 的基线/候选版本、差异计数、校验状态和错误摘要。dry-run 保存由 `vpn-platform-node-config-snapshot-v1` 规范化字节协议计算的 SHA-256 摘要；摘要不包含私钥。协议固定字段顺序、对网段/网关和设备公钥文本使用无填充 Base64URL、按设备 ID 排序，并将时间编码为 UTC RFC3339Nano；具体跨语言测试向量见 `internal/nodeprotocol/testdata/v1_vector.json`。
 
 管理员可提交 `{"candidate_version": 3}` 到节点审批接口。服务端仅接受与节点当前期望版本、最近一次有效 dry-run 和重新读取的候选快照摘要一致的审批；成功后使用服务端 Ed25519 私钥签发 10 分钟有效的一次性审批包，并在同一事务写入管理员审计记录。相同审批请求在仍有效时幂等返回原审批；候选版本或摘要变化后，旧审批无法再被 Agent 获取或验证。签名内容绑定节点 ID、候选版本、快照摘要、签发/过期时间和随机 nonce。
 
 Agent 应使用部署时固定的 Ed25519 公钥，在本地验证签名、目标节点 ID、当前 dry-run 版本和到期时间；`GET /v1/node/config/signing-key` 只便于查询公钥，不能作为未验证链路上的信任根。随后 Agent 可将审批包提交至 verify 接口；服务端再次核对签名、当前候选并原子消费 nonce，重复提交返回 `409 approval_replayed`。签名无效、版本/节点不符、候选已变化或审批过期均被拒绝。此流程只验证并消费审批，不应用配置；响应明确为 `applied: false`，后台没有配置应用按钮。服务端不会调用 `wg` 或连接节点配置接口。
+
+### 只读 Node Agent
+
+独立 Agent 位于 `cmd/node-agent`，一次运行只会依次请求 `GET /v1/node/config`、`GET /v1/node/config/approval`，在本机完成快照校验、摘要计算和 Ed25519 审批验证，再调用 `POST /v1/node/config/approval/verify` 消费一次性 nonce。Agent 不会调用 dry-run 写入接口、确认配置接口或任何配置应用接口，也没有 WireGuard 配置生成、隧道或流量转发代码。成功响应要求 `applied: false`；已消费 nonce 会以文件标记保存在本地状态目录中，POSIX 系统使用 `0700` 目录和 `0600` 文件权限，其他系统应由运维设置等效的本机 ACL。服务器端仍是 nonce 一次性消费的最终防线。
+
+Agent 通过环境变量配置：`API_BASE_URL`、`NODE_ID`、`NODE_CREDENTIAL`、`APPROVAL_PUBLIC_KEY`（标准 Base64 Ed25519 公钥）和 `AGENT_STATE_DIR`。远程地址必须为 HTTPS；仅 loopback HTTP 可用于本机开发。节点凭据只从环境读取，不作为命令行参数。公钥必须通过受信任的运维渠道固定到 Agent 配置，不能在 Agent 启动时从控制面不经验证地下载。示例：
+
+```powershell
+$env:API_BASE_URL = "https://control.example.test"
+$env:NODE_ID = "42"
+$env:NODE_CREDENTIAL = "<节点专属凭据>"
+$env:APPROVAL_PUBLIC_KEY = "<已核对并固定的 Ed25519 公钥 Base64>"
+$env:AGENT_STATE_DIR = "C:\ProgramData\vpn-platform-agent\state"
+go run ./cmd/node-agent
+```
+
+日志只输出节点 ID、版本、摘要和错误类别，不输出 Bearer 凭据、审批签名或私钥。审批签名 v1 覆盖 domain、节点 ID、候选版本、摘要、签发/到期 Unix 秒和 32 字节 nonce；审批最长有效 10 分钟。当前固定单一公钥，密钥轮换时应通过带 `key_id` 的受控公钥集合与重叠轮换窗口单独升级协议；签名私钥只留在控制面并放入受控密钥存储，`.env` 仅用于本地开发且不得提交。
+
+共享协议包和 Agent 的 golden/integration 单元测试在 CI 中运行，CI 另行构建 Agent。切换规范化摘要后，旧的 dry-run 摘要和审批不会再匹配；部署新版本后应重新生成 dry-run 并重新审批。
 
 解除分配或撤销设备后，对应地址会保持 `releasing` 并计入占用，直到 Agent 确认包含移除的配置版本；确认时服务端在事务中释放地址，之后才可复用。节点离线、同步失败或轮换凭据不会释放地址。变更节点 CIDR 需要先清空分配，并等待所有释放版本确认。迁移前创建的旧分配没有隧道地址；需在使用快照前解除并重新分配这些设备。此控制面仍不生成 WireGuard 配置、不建立隧道或转发用户流量。
 

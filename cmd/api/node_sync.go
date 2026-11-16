@@ -9,24 +9,11 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"vpn-platform/internal/nodeprotocol"
 )
 
-type nodeConfigDevice struct {
-	DeviceID      int64     `json:"device_id"`
-	PublicKey     string    `json:"public_key"`
-	Platform      string    `json:"platform"`
-	AssignedAt    time.Time `json:"assigned_at"`
-	TunnelAddress string    `json:"tunnel_address"`
-	Revoked       bool      `json:"-"`
-}
-
-type nodeConfigSnapshot struct {
-	NodeID         int64              `json:"node_id"`
-	Version        int64              `json:"version"`
-	TunnelCIDR     string             `json:"tunnel_cidr"`
-	GatewayAddress string             `json:"gateway_address"`
-	Devices        []nodeConfigDevice `json:"devices"`
-}
+type nodeConfigDevice = nodeprotocol.Device
+type nodeConfigSnapshot = nodeprotocol.Snapshot
 
 type acknowledgeNodeConfigRequest struct {
 	Version int64 `json:"version"`

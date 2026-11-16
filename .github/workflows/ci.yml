@@ -41,7 +41,7 @@ jobs:
       - name: Check formatting
         shell: bash
         run: |
-          files="$(find ./cmd -type f -name '*.go' -print0 | xargs -0 gofmt -l)"
+          files="$(find ./cmd ./internal -type f -name '*.go' -print0 | xargs -0 gofmt -l)"
           if [ -n "$files" ]; then
             echo "$files"
             exit 1
@@ -52,6 +52,9 @@ jobs:
 
       - name: Ensure dependency files are tidy
         run: git diff --exit-code -- go.mod go.sum
+
+      - name: Build read-only node agent
+        run: go build -o "$RUNNER_TEMP/node-agent" ./cmd/node-agent
 
       - name: Vet
         run: go vet ./...
