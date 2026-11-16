@@ -142,11 +142,12 @@
         <input id="nodeName" placeholder="节点名称" maxlength="100" required>
         <input id="nodeRegion" placeholder="区域" maxlength="80" required>
         <input id="nodeCapacity" type="number" min="1" value="100" title="容量" required>
+        <input id="nodeTunnelCIDR" placeholder="隧道 IPv4 网段，例如 10.80.0.0/24" required>
         <button class="primary">新增节点</button>
       </form>
       <p class="muted">节点凭据仅在创建或轮换时显示一次。心跳只更新控制面状态；此版本不配置隧道或转发流量。</p>
       <table>
-        <thead><tr><th>ID</th><th>名称</th><th>区域</th><th>管理状态</th><th>健康状态</th><th>容量/已分配</th><th>期望/确认版本</th><th>同步状态</th><th>最后同步</th><th>最近心跳</th><th>凭据</th><th>操作</th></tr></thead>
+        <thead><tr><th>ID</th><th>名称</th><th>区域</th><th>管理状态</th><th>健康状态</th><th>设备容量</th><th>隧道地址池</th><th>期望/确认版本</th><th>同步状态</th><th>最后同步</th><th>最近心跳</th><th>凭据</th><th>操作</th></tr></thead>
         <tbody id="nodesBody"></tbody>
       </table>
     </section>
@@ -488,6 +489,9 @@
       cell(tr, { active: "运行", maintenance: "维护", disabled: "停用" }[node.status] || node.status);
       cell(tr, { online: "在线", offline: "心跳过期/离线" }[node.health_status] || node.health_status);
       cell(tr, `${node.capacity} / ${node.assigned_device_count}`);
+      cell(tr, node.tunnel_cidr
+        ? `${node.tunnel_cidr} · 已占用 ${node.address_allocated}/${node.address_pool_size} · 剩余 ${node.address_available}`
+        : "未配置");
       cell(tr, `${node.desired_config_version} / ${node.acknowledged_config_version}`);
       cell(tr, node.sync_pending ? "待同步" : "已同步");
       cell(tr, dateText(node.last_sync_at) || "尚未确认");
@@ -520,9 +524,11 @@
         const capacityText = window.prompt("容量", String(node.capacity));
         if (capacityText === null) return;
         const capacity = Number(capacityText);
+        const tunnelCIDR = window.prompt("隧道 IPv4 网段（修改前需释放并确认所有地址）", node.tunnel_cidr || "");
+        if (tunnelCIDR === null) return;
         try {
           await api(`/v1/admin/nodes/${node.id}`, {
-            method: "PATCH", body: JSON.stringify({ name, region, capacity })
+            method: "PATCH", body: JSON.stringify({ name, region, capacity, tunnel_cidr: tunnelCIDR })
           });
           message(`节点 ${node.id} 元数据已更新`);
           await loadNodes();
@@ -623,7 +629,8 @@
         body: JSON.stringify({
           name: $("nodeName").value.trim(),
           region: $("nodeRegion").value.trim(),
-          capacity: Number($("nodeCapacity").value)
+          capacity: Number($("nodeCapacity").value),
+          tunnel_cidr: $("nodeTunnelCIDR").value.trim()
         })
       });
       $("nodeForm").reset();

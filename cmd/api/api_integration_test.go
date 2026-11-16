@@ -318,7 +318,7 @@ func TestNodeAdministrationAndCredentialLifecycle(t *testing.T) {
 	userToken := testToken(t, api, userID)
 
 	denied := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", userToken,
-		map[string]any{"name": "edge-a", "region": "test", "capacity": 100})
+		map[string]any{"name": "edge-a", "region": "test", "capacity": 100, "tunnel_cidr": "10.77.0.0/16"})
 	if denied.Code != http.StatusForbidden {
 		t.Fatalf("普通用户创建节点应返回 403，得到 %d：%s", denied.Code, denied.Body.String())
 	}
@@ -328,7 +328,7 @@ func TestNodeAdministrationAndCredentialLifecycle(t *testing.T) {
 	}
 	adminToken := testToken(t, api, userID)
 	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
-		map[string]any{"name": "edge-a", "region": "test-region", "capacity": 100})
+		map[string]any{"name": "edge-a", "region": "test-region", "capacity": 100, "tunnel_cidr": "10.77.0.0/16"})
 	if created.Code != http.StatusCreated {
 		t.Fatalf("管理员创建节点应返回 201，得到 %d：%s", created.Code, created.Body.String())
 	}
@@ -453,7 +453,7 @@ func TestNodeHealthStatusIsIndependentFromAdminStatus(t *testing.T) {
 	handler := testRouter(api)
 	adminToken := testToken(t, api, userID)
 	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
-		map[string]any{"name": "health-node", "region": "test", "capacity": 5})
+		map[string]any{"name": "health-node", "region": "test", "capacity": 5, "tunnel_cidr": "10.77.0.0/16"})
 	if created.Code != http.StatusCreated {
 		t.Fatalf("创建测试节点失败，得到 %d：%s", created.Code, created.Body.String())
 	}
@@ -548,7 +548,7 @@ func TestNodeCapacityCannotDropBelowAssignedDevices(t *testing.T) {
 		t.Fatalf("容量为 0 的节点应返回 400，得到 %d", invalid.Code)
 	}
 	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
-		map[string]any{"name": "capacity-node", "region": "test", "capacity": 2})
+		map[string]any{"name": "capacity-node", "region": "test", "capacity": 2, "tunnel_cidr": "10.77.0.0/16"})
 	if created.Code != http.StatusCreated {
 		t.Fatalf("创建测试节点失败，得到 %d：%s", created.Code, created.Body.String())
 	}
@@ -618,7 +618,7 @@ func TestAdminDeviceAssignmentChecksAndReleasesCapacity(t *testing.T) {
 	secondDeviceID := addTestDevice(t, api, otherUserID, "second", 41)
 
 	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
-		map[string]any{"name": "assignment-node", "region": "test", "capacity": 1})
+		map[string]any{"name": "assignment-node", "region": "test", "capacity": 1, "tunnel_cidr": "10.77.0.0/16"})
 	if created.Code != http.StatusCreated {
 		t.Fatalf("创建节点失败，得到 %d：%s", created.Code, created.Body.String())
 	}
@@ -626,6 +626,7 @@ func TestAdminDeviceAssignmentChecksAndReleasesCapacity(t *testing.T) {
 		Node struct {
 			ID int64 `json:"id"`
 		} `json:"node"`
+		Credential string `json:"credential"`
 	}
 	if err := json.Unmarshal(created.Body.Bytes(), &nodePayload); err != nil {
 		t.Fatalf("解析节点响应失败: %v", err)
@@ -672,6 +673,22 @@ func TestAdminDeviceAssignmentChecksAndReleasesCapacity(t *testing.T) {
 	}
 	if revoked {
 		t.Fatal("解除节点分配不应撤销设备")
+	}
+	// The address remains reserved until the node confirms the removal snapshot.
+	removalSnapshot := testRequest(t, handler, http.MethodGet, "/v1/node/config", nodePayload.Credential, nil)
+	if removalSnapshot.Code != http.StatusOK {
+		t.Fatalf("拉取解除分配快照失败：%d %s", removalSnapshot.Code, removalSnapshot.Body.String())
+	}
+	var removalVersion struct {
+		Version int64 `json:"version"`
+	}
+	if err := json.Unmarshal(removalSnapshot.Body.Bytes(), &removalVersion); err != nil || removalVersion.Version != 2 {
+		t.Fatalf("解除分配快照版本应为 2：%s (%v)", removalSnapshot.Body.String(), err)
+	}
+	acknowledged := testRequest(t, handler, http.MethodPost, "/v1/node/config/ack", nodePayload.Credential,
+		map[string]int64{"version": removalVersion.Version})
+	if acknowledged.Code != http.StatusNoContent {
+		t.Fatalf("确认解除分配快照失败：%d %s", acknowledged.Code, acknowledged.Body.String())
 	}
 	second := assign(secondDeviceID)
 	if second.Code != http.StatusCreated {
@@ -726,7 +743,7 @@ func TestDeviceAssignmentRequiresActiveUserAndSubscription(t *testing.T) {
 	handler := testRouter(api)
 
 	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
-		map[string]any{"name": "eligibility-node", "region": "test", "capacity": 10})
+		map[string]any{"name": "eligibility-node", "region": "test", "capacity": 10, "tunnel_cidr": "10.77.0.0/16"})
 	if created.Code != http.StatusCreated {
 		t.Fatalf("创建节点失败，得到 %d：%s", created.Code, created.Body.String())
 	}
@@ -781,7 +798,7 @@ func TestConcurrentDeviceAssignmentsRespectNodeCapacity(t *testing.T) {
 	adminToken := testToken(t, api, adminID)
 	handler := testRouter(api)
 	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
-		map[string]any{"name": "concurrent-node", "region": "test", "capacity": 1})
+		map[string]any{"name": "concurrent-node", "region": "test", "capacity": 1, "tunnel_cidr": "10.77.0.0/16"})
 	if created.Code != http.StatusCreated {
 		t.Fatalf("创建节点失败，得到 %d：%s", created.Code, created.Body.String())
 	}
@@ -849,7 +866,7 @@ func TestNodeConfigOutboxSnapshotAndAcknowledgement(t *testing.T) {
 	createNode := func(name string) (int64, string) {
 		t.Helper()
 		response := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
-			map[string]any{"name": name, "region": "test", "capacity": 4})
+			map[string]any{"name": name, "region": "test", "capacity": 4, "tunnel_cidr": "10.77.0.0/16"})
 		if response.Code != http.StatusCreated {
 			t.Fatalf("创建节点失败，得到 %d：%s", response.Code, response.Body.String())
 		}
@@ -894,16 +911,18 @@ func TestNodeConfigOutboxSnapshotAndAcknowledgement(t *testing.T) {
 		NodeID  int64 `json:"node_id"`
 		Version int64 `json:"version"`
 		Devices []struct {
-			DeviceID  int64  `json:"device_id"`
-			PublicKey string `json:"public_key"`
-			Platform  string `json:"platform"`
+			DeviceID      int64  `json:"device_id"`
+			PublicKey     string `json:"public_key"`
+			Platform      string `json:"platform"`
+			TunnelAddress string `json:"tunnel_address"`
 		} `json:"devices"`
 	}
 	if err := json.Unmarshal(snapshotA.Body.Bytes(), &configA); err != nil {
 		t.Fatalf("解析节点 A 快照失败: %v", err)
 	}
 	if configA.NodeID != nodeA || configA.Version != 1 || len(configA.Devices) != 1 ||
-		configA.Devices[0].DeviceID != deviceA || configA.Devices[0].PublicKey != keyA {
+		configA.Devices[0].DeviceID != deviceA || configA.Devices[0].PublicKey != keyA ||
+		configA.Devices[0].TunnelAddress == "" {
 		t.Fatalf("节点 A 快照内容不符合预期：%s", snapshotA.Body.String())
 	}
 	if bytes.Contains(snapshotA.Body.Bytes(), []byte(keyB)) ||
@@ -1001,6 +1020,197 @@ func TestNodeConfigOutboxSnapshotAndAcknowledgement(t *testing.T) {
 	}
 	if response := ack(credentialA, 2); response.Code != http.StatusUnauthorized {
 		t.Fatalf("撤销凭据后节点不得确认配置，得到 %d", response.Code)
+	}
+}
+
+func TestTunnelAddressPoolBoundariesUniquenessAndConcurrency(t *testing.T) {
+	api, adminID, cleanup := testFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := api.db.Exec(ctx, `UPDATE users SET role = 'admin' WHERE id = $1`, adminID); err != nil {
+		t.Fatalf("设置测试管理员失败: %v", err)
+	}
+	addActiveTestPlan(t, api, adminID, 20)
+	adminToken := testToken(t, api, adminID)
+	handler := testRouter(api)
+	createNode := func(name string, capacity int, cidr string) (int64, string, int) {
+		t.Helper()
+		response := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
+			map[string]any{"name": name, "region": "test", "capacity": capacity, "tunnel_cidr": cidr})
+		var result struct {
+			Node struct {
+				ID               int64 `json:"id"`
+				AddressPoolSize  int64 `json:"address_pool_size"`
+				AddressAvailable int64 `json:"address_available"`
+			} `json:"node"`
+			Credential string `json:"credential"`
+		}
+		if response.Code == http.StatusCreated {
+			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+				t.Fatalf("解析节点响应失败: %v", err)
+			}
+		}
+		return result.Node.ID, result.Credential, response.Code
+	}
+	if _, _, status := createNode("too-large-for-subnet", 2, "10.88.0.0/30"); status != http.StatusBadRequest {
+		t.Fatalf("/30 只有一个可用设备地址，容量 2 应返回 400，得到 %d", status)
+	}
+	nodeID, _, status := createNode("boundary-node", 5, "10.88.0.0/29")
+	if status != http.StatusCreated {
+		t.Fatalf("/29 配置 5 个地址应成功，得到 %d", status)
+	}
+
+	deviceIDs := make([]int64, 5)
+	for i := range deviceIDs {
+		deviceIDs[i] = addTestDevice(t, api, adminID, fmt.Sprintf("boundary-%d", i), byte(80+i))
+	}
+	addresses := make(map[string]bool)
+	for i, deviceID := range deviceIDs {
+		response := testRequest(t, handler, http.MethodPut,
+			fmt.Sprintf("/v1/admin/devices/%d/assignment", deviceID), adminToken,
+			map[string]int64{"node_id": nodeID})
+		if response.Code != http.StatusCreated {
+			t.Fatalf("分配边界地址 %d 失败：%d %s", i, response.Code, response.Body.String())
+		}
+		var assignment struct {
+			TunnelAddress string `json:"tunnel_address"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &assignment); err != nil {
+			t.Fatalf("解析地址分配响应失败: %v", err)
+		}
+		expected := fmt.Sprintf("10.88.0.%d", i+2)
+		if assignment.TunnelAddress != expected {
+			t.Fatalf("地址应避开网络、网关和广播地址，期望 %s，得到 %s", expected, assignment.TunnelAddress)
+		}
+		if addresses[assignment.TunnelAddress] {
+			t.Fatalf("节点地址重复分配：%s", assignment.TunnelAddress)
+		}
+		addresses[assignment.TunnelAddress] = true
+	}
+	if len(addresses) != 5 || addresses["10.88.0.0"] || addresses["10.88.0.1"] || addresses["10.88.0.7"] {
+		t.Fatalf("/29 地址池边界或唯一性错误：%v", addresses)
+	}
+
+	// Two simultaneous allocators share a /29 pool and must receive distinct IPs.
+	concurrentNodeID, _, status := createNode("concurrent-address-node", 2, "10.89.0.0/29")
+	if status != http.StatusCreated {
+		t.Fatalf("创建并发地址节点失败：%d", status)
+	}
+	concurrentDevices := []int64{
+		addTestDevice(t, api, adminID, "address-concurrent-a", 90),
+		addTestDevice(t, api, adminID, "address-concurrent-b", 91),
+	}
+	var wg sync.WaitGroup
+	results := make(chan *httptest.ResponseRecorder, len(concurrentDevices))
+	for _, deviceID := range concurrentDevices {
+		deviceID := deviceID
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- testRequest(t, handler, http.MethodPut,
+				fmt.Sprintf("/v1/admin/devices/%d/assignment", deviceID), adminToken,
+				map[string]int64{"node_id": concurrentNodeID})
+		}()
+	}
+	wg.Wait()
+	close(results)
+	concurrentAddresses := map[string]bool{}
+	for response := range results {
+		if response.Code != http.StatusCreated {
+			t.Fatalf("并发地址分配应成功，得到 %d：%s", response.Code, response.Body.String())
+		}
+		var item struct {
+			TunnelAddress string `json:"tunnel_address"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &item); err != nil {
+			t.Fatalf("解析并发地址响应失败: %v", err)
+		}
+		concurrentAddresses[item.TunnelAddress] = true
+	}
+	if len(concurrentAddresses) != 2 {
+		t.Fatalf("并发分配应得到两个不同地址，实际为 %v", concurrentAddresses)
+	}
+}
+
+func TestTunnelAddressNotReusedUntilRemovalAcknowledged(t *testing.T) {
+	api, adminID, cleanup := testFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := api.db.Exec(ctx, `UPDATE users SET role = 'admin' WHERE id = $1`, adminID); err != nil {
+		t.Fatalf("设置测试管理员失败: %v", err)
+	}
+	addActiveTestPlan(t, api, adminID, 5)
+	adminToken := testToken(t, api, adminID)
+	handler := testRouter(api)
+	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
+		map[string]any{"name": "release-node", "region": "test", "capacity": 1, "tunnel_cidr": "10.90.0.0/30"})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("创建 /30 测试节点失败：%d %s", created.Code, created.Body.String())
+	}
+	var node struct {
+		Node struct {
+			ID int64 `json:"id"`
+		} `json:"node"`
+		Credential string `json:"credential"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &node); err != nil {
+		t.Fatalf("解析节点响应失败: %v", err)
+	}
+	first := addTestDevice(t, api, adminID, "release-first", 101)
+	second := addTestDevice(t, api, adminID, "release-second", 102)
+	assign := func(deviceID int64) *httptest.ResponseRecorder {
+		t.Helper()
+		return testRequest(t, handler, http.MethodPut,
+			fmt.Sprintf("/v1/admin/devices/%d/assignment", deviceID), adminToken,
+			map[string]int64{"node_id": node.Node.ID})
+	}
+	firstResult := assign(first)
+	if firstResult.Code != http.StatusCreated {
+		t.Fatalf("首次地址分配失败：%d %s", firstResult.Code, firstResult.Body.String())
+	}
+	var firstAddress struct {
+		TunnelAddress string `json:"tunnel_address"`
+	}
+	if err := json.Unmarshal(firstResult.Body.Bytes(), &firstAddress); err != nil || firstAddress.TunnelAddress != "10.90.0.2" {
+		t.Fatalf("/30 的唯一设备地址应为 .2：%s (%v)", firstResult.Body.String(), err)
+	}
+	ack := func(version int64) *httptest.ResponseRecorder {
+		t.Helper()
+		return testRequest(t, handler, http.MethodPost, "/v1/node/config/ack", node.Credential,
+			map[string]int64{"version": version})
+	}
+	if response := ack(1); response.Code != http.StatusNoContent {
+		t.Fatalf("确认初始配置失败：%d %s", response.Code, response.Body.String())
+	}
+	removed := testRequest(t, handler, http.MethodDelete,
+		fmt.Sprintf("/v1/admin/devices/%d/assignment", first), adminToken, nil)
+	if removed.Code != http.StatusNoContent {
+		t.Fatalf("解除分配失败：%d %s", removed.Code, removed.Body.String())
+	}
+	blocked := assign(second)
+	if blocked.Code != http.StatusConflict || !strings.Contains(blocked.Body.String(), "node_address_pool_exhausted") {
+		t.Fatalf("未确认移除前地址必须保留，期望地址池冲突，得到 %d：%s", blocked.Code, blocked.Body.String())
+	}
+	var state string
+	var releaseVersion int64
+	if err := api.db.QueryRow(ctx,
+		`SELECT state, release_version FROM node_tunnel_addresses WHERE node_id = $1 AND device_id = $2`,
+		node.Node.ID, first,
+	).Scan(&state, &releaseVersion); err != nil || state != "releasing" || releaseVersion != 2 {
+		t.Fatalf("解除分配地址应保留到版本 2 确认：state=%s version=%d err=%v", state, releaseVersion, err)
+	}
+	if response := ack(2); response.Code != http.StatusNoContent {
+		t.Fatalf("确认移除版本失败：%d %s", response.Code, response.Body.String())
+	}
+	reused := assign(second)
+	if reused.Code != http.StatusCreated {
+		t.Fatalf("确认移除后应能复用地址：%d %s", reused.Code, reused.Body.String())
+	}
+	var secondAddress struct {
+		TunnelAddress string `json:"tunnel_address"`
+	}
+	if err := json.Unmarshal(reused.Body.Bytes(), &secondAddress); err != nil || secondAddress.TunnelAddress != firstAddress.TunnelAddress {
+		t.Fatalf("确认移除后应复用释放地址，首次=%s 再次=%s err=%v", firstAddress.TunnelAddress, secondAddress.TunnelAddress, err)
 	}
 }
 

@@ -20,6 +20,10 @@ type nodeRecord struct {
 	HealthStatus     string     `json:"health_status"`
 	Capacity         int        `json:"capacity"`
 	AssignedDevices  int        `json:"assigned_device_count"`
+	TunnelCIDR       string     `json:"tunnel_cidr"`
+	AddressPoolSize  int64      `json:"address_pool_size"`
+	AddressAllocated int64      `json:"address_allocated"`
+	AddressAvailable int64      `json:"address_available"`
 	DesiredVersion   int64      `json:"desired_config_version"`
 	AckVersion       int64      `json:"acknowledged_config_version"`
 	SyncPending      bool       `json:"sync_pending"`
@@ -30,15 +34,17 @@ type nodeRecord struct {
 }
 
 type createNodeRequest struct {
-	Name     string `json:"name"`
-	Region   string `json:"region"`
-	Capacity int    `json:"capacity"`
+	Name       string `json:"name"`
+	Region     string `json:"region"`
+	Capacity   int    `json:"capacity"`
+	TunnelCIDR string `json:"tunnel_cidr"`
 }
 
 type updateNodeRequest struct {
-	Name     *string `json:"name"`
-	Region   *string `json:"region"`
-	Capacity *int    `json:"capacity"`
+	Name       *string `json:"name"`
+	Region     *string `json:"region"`
+	Capacity   *int    `json:"capacity"`
+	TunnelCIDR *string `json:"tunnel_cidr"`
 }
 
 type setNodeStatusRequest struct {
@@ -47,6 +53,7 @@ type setNodeStatusRequest struct {
 
 const nodeSelectColumns = `id, name, region, status, capacity, created_at,
 	last_heartbeat_at,
+	COALESCE(tunnel_cidr::text, ''),
 	EXISTS (SELECT 1 FROM node_credentials c
 	        WHERE c.node_id = nodes.id AND c.revoked_at IS NULL),
 	CASE WHEN last_heartbeat_at > NOW() - INTERVAL '90 seconds'
@@ -54,8 +61,30 @@ const nodeSelectColumns = `id, name, region, status, capacity, created_at,
 	(SELECT COUNT(*)::int FROM node_device_assignments a
 	 JOIN devices d ON d.id = a.device_id
 	 WHERE a.node_id = nodes.id AND d.revoked_at IS NULL),
+	(SELECT COUNT(*)::bigint FROM node_tunnel_addresses ta WHERE ta.node_id = nodes.id),
 	desired_config_version, acknowledged_config_version,
 	(acknowledged_config_version < desired_config_version), last_sync_at`
+
+func scanNodeRecord(row interface{ Scan(...any) error }) (nodeRecord, error) {
+	var node nodeRecord
+	err := row.Scan(
+		&node.ID, &node.Name, &node.Region, &node.Status, &node.Capacity,
+		&node.CreatedAt, &node.LastHeartbeatAt, &node.TunnelCIDR,
+		&node.CredentialActive, &node.HealthStatus, &node.AssignedDevices,
+		&node.AddressAllocated, &node.DesiredVersion, &node.AckVersion,
+		&node.SyncPending, &node.LastSyncAt,
+	)
+	if err != nil {
+		return node, err
+	}
+	if node.TunnelCIDR != "" {
+		if _, size, err := parseTunnelPrefix(node.TunnelCIDR); err == nil {
+			node.AddressPoolSize = int64(size)
+			node.AddressAvailable = int64(size) - node.AddressAllocated
+		}
+	}
+	return node, nil
+}
 
 func generateNodeCredential() (string, [32]byte, error) {
 	var raw [32]byte
@@ -82,7 +111,9 @@ func (a *API) adminCreateNode(w http.ResponseWriter, r *http.Request) {
 	}
 	in.Name = strings.TrimSpace(in.Name)
 	in.Region = strings.TrimSpace(in.Region)
-	if !validNodeMetadata(in.Name, in.Region, in.Capacity) {
+	in.TunnelCIDR = strings.TrimSpace(in.TunnelCIDR)
+	prefix, err := parseTunnelPrefixForCapacity(in.TunnelCIDR, in.Capacity)
+	if !validNodeMetadata(in.Name, in.Region, in.Capacity) || err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_node"})
 		return
 	}
@@ -102,10 +133,10 @@ func (a *API) adminCreateNode(w http.ResponseWriter, r *http.Request) {
 
 	var node nodeRecord
 	err = tx.QueryRow(r.Context(),
-		`INSERT INTO nodes (name, region, capacity)
-		 VALUES ($1, $2, $3)
+		`INSERT INTO nodes (name, region, capacity, tunnel_cidr)
+		 VALUES ($1, $2, $3, $4::cidr)
 		 RETURNING id, name, region, status, capacity, created_at, last_heartbeat_at`,
-		in.Name, in.Region, in.Capacity,
+		in.Name, in.Region, in.Capacity, prefix.String(),
 	).Scan(&node.ID, &node.Name, &node.Region, &node.Status, &node.Capacity, &node.CreatedAt, &node.LastHeartbeatAt)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
@@ -129,6 +160,10 @@ func (a *API) adminCreateNode(w http.ResponseWriter, r *http.Request) {
 
 	node.CredentialActive = true
 	node.HealthStatus = "offline"
+	node.TunnelCIDR = prefix.String()
+	_, poolSize, _ := parseTunnelPrefix(prefix.String())
+	node.AddressPoolSize = int64(poolSize)
+	node.AddressAvailable = int64(poolSize)
 	writeJSON(w, http.StatusCreated, map[string]any{"node": node, "credential": credential})
 }
 
@@ -151,13 +186,8 @@ func (a *API) adminListNodes(w http.ResponseWriter, r *http.Request) {
 
 	nodes := make([]nodeRecord, 0)
 	for rows.Next() {
-		var node nodeRecord
-		if err := rows.Scan(
-			&node.ID, &node.Name, &node.Region, &node.Status,
-			&node.Capacity, &node.CreatedAt, &node.LastHeartbeatAt,
-			&node.CredentialActive, &node.HealthStatus, &node.AssignedDevices,
-			&node.DesiredVersion, &node.AckVersion, &node.SyncPending, &node.LastSyncAt,
-		); err != nil {
+		node, err := scanNodeRecord(rows)
+		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 			return
 		}
@@ -184,7 +214,7 @@ func (a *API) adminUpdateNode(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &in) {
 		return
 	}
-	if in.Name == nil && in.Region == nil && in.Capacity == nil {
+	if in.Name == nil && in.Region == nil && in.Capacity == nil && in.TunnelCIDR == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty_node_update"})
 		return
 	}
@@ -196,15 +226,15 @@ func (a *API) adminUpdateNode(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 
-	var name, region string
+	var name, region, tunnelCIDR, originalTunnelCIDR string
 	var capacity, assignedDevices int
 	err = tx.QueryRow(r.Context(),
-		`SELECT n.name, n.region, n.capacity,
+		`SELECT n.name, n.region, n.capacity, COALESCE(n.tunnel_cidr::text, ''),
 		        (SELECT COUNT(*)::int FROM node_device_assignments a
 		         JOIN devices d ON d.id = a.device_id
 		         WHERE a.node_id = n.id AND d.revoked_at IS NULL)
 		 FROM nodes n WHERE n.id = $1 FOR UPDATE`, nodeID,
-	).Scan(&name, &region, &capacity, &assignedDevices)
+	).Scan(&name, &region, &capacity, &tunnelCIDR, &assignedDevices)
 	if err == pgx.ErrNoRows {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "node_not_found"})
 		return
@@ -213,6 +243,7 @@ func (a *API) adminUpdateNode(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
+	originalTunnelCIDR = tunnelCIDR
 	if in.Name != nil {
 		name = strings.TrimSpace(*in.Name)
 	}
@@ -221,6 +252,9 @@ func (a *API) adminUpdateNode(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.Capacity != nil {
 		capacity = *in.Capacity
+	}
+	if in.TunnelCIDR != nil {
+		tunnelCIDR = strings.TrimSpace(*in.TunnelCIDR)
 	}
 	if !validNodeMetadata(name, region, capacity) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_node"})
@@ -233,29 +267,37 @@ func (a *API) adminUpdateNode(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if tunnelCIDR != "" {
+		if _, err := parseTunnelPrefixForCapacity(tunnelCIDR, capacity); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_tunnel_cidr_or_capacity"})
+			return
+		}
+	}
+	if in.TunnelCIDR != nil && tunnelCIDR != originalTunnelCIDR {
+		var reserved int64
+		if err := tx.QueryRow(r.Context(),
+			`SELECT
+			   (SELECT COUNT(*) FROM node_device_assignments WHERE node_id = $1) +
+			   (SELECT COUNT(*) FROM node_tunnel_addresses WHERE node_id = $1)`,
+			nodeID,
+		).Scan(&reserved); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+			return
+		}
+		if reserved > 0 {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "cannot_change_tunnel_cidr_while_assignments_or_addresses_reserved"})
+			return
+		}
+	}
 
-	var node nodeRecord
-	err = tx.QueryRow(r.Context(),
-		`UPDATE nodes SET name = $1, region = $2, capacity = $3
-		 WHERE id = $4
-		 RETURNING id, name, region, status, capacity, created_at,
-		           last_heartbeat_at,
-		           EXISTS (SELECT 1 FROM node_credentials c
-		                   WHERE c.node_id = nodes.id AND c.revoked_at IS NULL),
-		           CASE WHEN last_heartbeat_at > NOW() - INTERVAL '90 seconds'
-		                THEN 'online' ELSE 'offline' END,
-		           (SELECT COUNT(*)::int FROM node_device_assignments a
-		            JOIN devices d ON d.id = a.device_id
-		            WHERE a.node_id = nodes.id AND d.revoked_at IS NULL),
-		           desired_config_version, acknowledged_config_version,
-		           (acknowledged_config_version < desired_config_version), last_sync_at`,
-		name, region, capacity, nodeID,
-	).Scan(
-		&node.ID, &node.Name, &node.Region, &node.Status, &node.Capacity,
-		&node.CreatedAt, &node.LastHeartbeatAt, &node.CredentialActive,
-		&node.HealthStatus, &node.AssignedDevices,
-		&node.DesiredVersion, &node.AckVersion, &node.SyncPending, &node.LastSyncAt,
-	)
+	if _, err := tx.Exec(r.Context(),
+		`UPDATE nodes SET name = $1, region = $2, capacity = $3, tunnel_cidr = NULLIF($4, '')::cidr
+		 WHERE id = $5`, name, region, capacity, tunnelCIDR, nodeID,
+	); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	node, err := scanNodeRecord(tx.QueryRow(r.Context(), `SELECT `+nodeSelectColumns+` FROM nodes WHERE id = $1`, nodeID))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
@@ -299,27 +341,12 @@ func (a *API) adminSetNodeStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 
-	var node nodeRecord
-	err = tx.QueryRow(r.Context(),
-		`UPDATE nodes SET status = $1 WHERE id = $2
-		 RETURNING id, name, region, status, capacity, created_at,
-		           last_heartbeat_at,
-		           EXISTS (SELECT 1 FROM node_credentials c
-		                   WHERE c.node_id = nodes.id AND c.revoked_at IS NULL),
-		           CASE WHEN last_heartbeat_at > NOW() - INTERVAL '90 seconds'
-		                THEN 'online' ELSE 'offline' END,
-		           (SELECT COUNT(*)::int FROM node_device_assignments a
-		            JOIN devices d ON d.id = a.device_id
-		            WHERE a.node_id = nodes.id AND d.revoked_at IS NULL),
-		           desired_config_version, acknowledged_config_version,
-		           (acknowledged_config_version < desired_config_version), last_sync_at`,
-		in.Status, nodeID,
-	).Scan(
-		&node.ID, &node.Name, &node.Region, &node.Status, &node.Capacity,
-		&node.CreatedAt, &node.LastHeartbeatAt, &node.CredentialActive,
-		&node.HealthStatus, &node.AssignedDevices,
-		&node.DesiredVersion, &node.AckVersion, &node.SyncPending, &node.LastSyncAt,
-	)
+	_, err = tx.Exec(r.Context(), `UPDATE nodes SET status = $1 WHERE id = $2`, in.Status, nodeID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	node, err := scanNodeRecord(tx.QueryRow(r.Context(), `SELECT `+nodeSelectColumns+` FROM nodes WHERE id = $1`, nodeID))
 	if err == pgx.ErrNoRows {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "node_not_found"})
 		return

@@ -13,11 +13,12 @@ type assignDeviceRequest struct {
 }
 
 type deviceAssignmentRecord struct {
-	DeviceID   int64     `json:"device_id"`
-	NodeID     int64     `json:"node_id"`
-	NodeName   string    `json:"node_name"`
-	Status     string    `json:"status"`
-	AssignedAt time.Time `json:"assigned_at"`
+	DeviceID      int64     `json:"device_id"`
+	NodeID        int64     `json:"node_id"`
+	NodeName      string    `json:"node_name"`
+	Status        string    `json:"status"`
+	AssignedAt    time.Time `json:"assigned_at"`
+	TunnelAddress string    `json:"tunnel_address"`
 }
 
 func (a *API) adminAssignDeviceToNode(w http.ResponseWriter, r *http.Request) {
@@ -111,11 +112,11 @@ func (a *API) adminAssignDeviceToNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var nodeStatus string
+	var nodeStatus, tunnelCIDR string
 	var capacity int
 	err = tx.QueryRow(r.Context(),
-		`SELECT status, capacity FROM nodes WHERE id = $1 FOR UPDATE`, in.NodeID,
-	).Scan(&nodeStatus, &capacity)
+		`SELECT status, capacity, COALESCE(tunnel_cidr::text, '') FROM nodes WHERE id = $1 FOR UPDATE`, in.NodeID,
+	).Scan(&nodeStatus, &capacity, &tunnelCIDR)
 	if err == pgx.ErrNoRows {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "node_not_found"})
 		return
@@ -126,6 +127,15 @@ func (a *API) adminAssignDeviceToNode(w http.ResponseWriter, r *http.Request) {
 	}
 	if nodeStatus != "active" {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "node_not_assignable"})
+		return
+	}
+	if tunnelCIDR == "" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "node_tunnel_cidr_required"})
+		return
+	}
+	prefix, _, err := parseTunnelPrefix(tunnelCIDR)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "node_tunnel_cidr_invalid"})
 		return
 	}
 
@@ -148,6 +158,15 @@ func (a *API) adminAssignDeviceToNode(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	address, err := allocateTunnelAddress(tx, r.Context(), in.NodeID, deviceID, prefix)
+	if err == errTunnelAddressPoolExhausted {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "node_address_pool_exhausted"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
 
 	var assignment deviceAssignmentRecord
 	err = tx.QueryRow(r.Context(),
@@ -160,7 +179,7 @@ func (a *API) adminAssignDeviceToNode(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
-	if err := recordNodeConfigChange(r.Context(), tx, in.NodeID, "device_assigned", deviceID); err != nil {
+	if _, err := recordNodeConfigChange(r.Context(), tx, in.NodeID, "device_assigned", deviceID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
@@ -172,6 +191,7 @@ func (a *API) adminAssignDeviceToNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	assignment.Status = nodeStatus
+	assignment.TunnelAddress = address.String()
 	if err := insertAudit(r, tx, actorID, "assign_device_node", "device", deviceID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
@@ -238,7 +258,12 @@ func (a *API) adminUnassignDeviceFromNode(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "device_not_assigned"})
 		return
 	}
-	if err := recordNodeConfigChange(r.Context(), tx, nodeID, "device_unassigned", deviceID); err != nil {
+	version, err := recordNodeConfigChange(r.Context(), tx, nodeID, "device_unassigned", deviceID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	if err := markTunnelAddressReleasing(r.Context(), tx, nodeID, deviceID, version); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}

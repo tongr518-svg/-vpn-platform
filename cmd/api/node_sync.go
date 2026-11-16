@@ -11,16 +11,19 @@ import (
 )
 
 type nodeConfigDevice struct {
-	DeviceID   int64     `json:"device_id"`
-	PublicKey  string    `json:"public_key"`
-	Platform   string    `json:"platform"`
-	AssignedAt time.Time `json:"assigned_at"`
+	DeviceID      int64     `json:"device_id"`
+	PublicKey     string    `json:"public_key"`
+	Platform      string    `json:"platform"`
+	AssignedAt    time.Time `json:"assigned_at"`
+	TunnelAddress string    `json:"tunnel_address"`
 }
 
 type nodeConfigSnapshot struct {
-	NodeID  int64              `json:"node_id"`
-	Version int64              `json:"version"`
-	Devices []nodeConfigDevice `json:"devices"`
+	NodeID         int64              `json:"node_id"`
+	Version        int64              `json:"version"`
+	TunnelCIDR     string             `json:"tunnel_cidr"`
+	GatewayAddress string             `json:"gateway_address"`
+	Devices        []nodeConfigDevice `json:"devices"`
 }
 
 type acknowledgeNodeConfigRequest struct {
@@ -35,7 +38,7 @@ func recordNodeConfigChange(
 	nodeID int64,
 	eventType string,
 	deviceID int64,
-) error {
+) (int64, error) {
 	var version int64
 	if err := tx.QueryRow(ctx,
 		`UPDATE nodes
@@ -44,14 +47,14 @@ func recordNodeConfigChange(
 		 RETURNING desired_config_version`,
 		nodeID,
 	).Scan(&version); err != nil {
-		return err
+		return 0, err
 	}
 	_, err := tx.Exec(ctx,
 		`INSERT INTO node_config_outbox (node_id, version, event_type, device_id)
 		 VALUES ($1, $2, $3, $4)`,
 		nodeID, version, eventType, deviceID,
 	)
-	return err
+	return version, err
 }
 
 func nodeCredentialHash(r *http.Request) ([32]byte, bool) {
@@ -110,11 +113,29 @@ func (a *API) nodeConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
+	var tunnelCIDR string
+	if err := tx.QueryRow(r.Context(),
+		`SELECT COALESCE(tunnel_cidr::text, '') FROM nodes WHERE id = $1`, snapshot.NodeID,
+	).Scan(&tunnelCIDR); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	snapshot.TunnelCIDR = tunnelCIDR
+	if tunnelCIDR != "" {
+		prefix, _, parseErr := parseTunnelPrefix(tunnelCIDR)
+		if parseErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "invalid_node_tunnel_cidr"})
+			return
+		}
+		snapshot.GatewayAddress = prefixAddress(prefix, 1).String()
+	}
 
 	rows, err := tx.Query(r.Context(),
-		`SELECT d.id, d.public_key, d.platform, a.assigned_at
+		`SELECT d.id, d.public_key, d.platform, a.assigned_at, ta.address::text
 		 FROM node_device_assignments a
 		 JOIN devices d ON d.id = a.device_id
+		 LEFT JOIN node_tunnel_addresses ta
+		   ON ta.node_id = a.node_id AND ta.device_id = a.device_id AND ta.state = 'assigned'
 		 WHERE a.node_id = $1 AND d.revoked_at IS NULL
 		 ORDER BY d.id`,
 		snapshot.NodeID,
@@ -126,11 +147,18 @@ func (a *API) nodeConfig(w http.ResponseWriter, r *http.Request) {
 	snapshot.Devices = make([]nodeConfigDevice, 0)
 	for rows.Next() {
 		var item nodeConfigDevice
-		if err := rows.Scan(&item.DeviceID, &item.PublicKey, &item.Platform, &item.AssignedAt); err != nil {
+		var tunnelAddress *string
+		if err := rows.Scan(&item.DeviceID, &item.PublicKey, &item.Platform, &item.AssignedAt, &tunnelAddress); err != nil {
 			rows.Close()
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 			return
 		}
+		if tunnelAddress == nil {
+			rows.Close()
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "device_tunnel_address_missing"})
+			return
+		}
+		item.TunnelAddress = *tunnelAddress
 		snapshot.Devices = append(snapshot.Devices, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -224,6 +252,14 @@ func (a *API) acknowledgeNodeConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := tx.Exec(r.Context(),
+		`DELETE FROM node_tunnel_addresses
+		 WHERE node_id = $1 AND state = 'releasing' AND release_version <= $2`,
+		nodeID, in.Version,
+	); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	if _, err := tx.Exec(r.Context(),
 		`UPDATE node_config_outbox
 		 SET acknowledged_at = COALESCE(acknowledged_at, NOW())
 		 WHERE node_id = $1 AND version <= $2`,
@@ -255,5 +291,9 @@ func addDeviceConfigOutboxForRevocation(ctx context.Context, tx pgx.Tx, deviceID
 	if err != nil {
 		return err
 	}
-	return recordNodeConfigChange(ctx, tx, nodeID, "device_revoked", deviceID)
+	version, err := recordNodeConfigChange(ctx, tx, nodeID, "device_revoked", deviceID)
+	if err != nil {
+		return err
+	}
+	return markTunnelAddressReleasing(ctx, tx, nodeID, deviceID, version)
 }
