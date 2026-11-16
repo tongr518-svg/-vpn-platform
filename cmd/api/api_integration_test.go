@@ -1214,6 +1214,119 @@ func TestTunnelAddressNotReusedUntilRemovalAcknowledged(t *testing.T) {
 	}
 }
 
+func TestNodeConfigDryRunReportsValidationAndDoesNotExposePrivateData(t *testing.T) {
+	api, adminID, cleanup := testFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := api.db.Exec(ctx, `UPDATE users SET role = 'admin' WHERE id = $1`, adminID); err != nil {
+		t.Fatalf("设置测试管理员失败: %v", err)
+	}
+	addActiveTestPlan(t, api, adminID, 5)
+	adminToken := testToken(t, api, adminID)
+	handler := testRouter(api)
+	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
+		map[string]any{"name": "dry-run-node", "region": "test", "capacity": 5, "tunnel_cidr": "10.74.0.0/29"})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("创建 dry-run 节点失败：%d %s", created.Code, created.Body.String())
+	}
+	var node struct {
+		Node struct {
+			ID int64 `json:"id"`
+		} `json:"node"`
+		Credential string `json:"credential"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &node); err != nil {
+		t.Fatalf("解析节点响应失败: %v", err)
+	}
+	deviceID := addTestDevice(t, api, adminID, "dry-run-device", 111)
+	assigned := testRequest(t, handler, http.MethodPut,
+		fmt.Sprintf("/v1/admin/devices/%d/assignment", deviceID), adminToken,
+		map[string]int64{"node_id": node.Node.ID})
+	if assigned.Code != http.StatusCreated {
+		t.Fatalf("分配 dry-run 测试设备失败：%d %s", assigned.Code, assigned.Body.String())
+	}
+	base := nodeConfigSnapshot{
+		NodeID: node.Node.ID, Version: 0, TunnelCIDR: "10.74.0.0/29", GatewayAddress: "10.74.0.1",
+		Devices: []nodeConfigDevice{},
+	}
+	dryRun := func(snapshot nodeConfigSnapshot) *httptest.ResponseRecorder {
+		t.Helper()
+		return testRequest(t, handler, http.MethodPost, "/v1/node/config/dry-run", node.Credential,
+			map[string]any{"confirmed_snapshot": snapshot})
+	}
+	response := dryRun(base)
+	if response.Code != http.StatusOK {
+		t.Fatalf("有效候选 dry-run 应返回 200，得到 %d：%s", response.Code, response.Body.String())
+	}
+	if bytes.Contains(response.Body.Bytes(), []byte("private_key")) || bytes.Contains(response.Body.Bytes(), []byte("privateKey")) {
+		t.Fatalf("dry-run 响应不得包含私钥字段：%s", response.Body.String())
+	}
+	var result struct {
+		DryRun struct {
+			Status           string   `json:"status"`
+			ConfirmedVersion int64    `json:"confirmed_version"`
+			CandidateVersion int64    `json:"candidate_version"`
+			AddedCount       int      `json:"added_count"`
+			ValidationErrors []string `json:"validation_errors"`
+		} `json:"dry_run"`
+		Plan struct {
+			Added []dryRunPeerChange `json:"added"`
+		} `json:"plan"`
+		Applied bool `json:"applied"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatalf("解析 dry-run 响应失败: %v", err)
+	}
+	if result.DryRun.Status != "valid" || result.DryRun.ConfirmedVersion != 0 ||
+		result.DryRun.CandidateVersion != 1 || result.DryRun.AddedCount != 1 ||
+		len(result.Plan.Added) != 1 || result.Plan.Added[0].DeviceID != deviceID || result.Applied {
+		t.Fatalf("dry-run 摘要或候选差异不正确：%s", response.Body.String())
+	}
+	privateField := testRequest(t, handler, http.MethodPost, "/v1/node/config/dry-run", node.Credential,
+		map[string]any{"confirmed_snapshot": map[string]any{
+			"node_id": node.Node.ID, "version": 0, "tunnel_cidr": "10.74.0.0/29",
+			"gateway_address": "10.74.0.1",
+			"devices": []any{map[string]any{
+				"device_id": deviceID, "public_key": testPublicKey(111), "platform": "windows",
+				"tunnel_address": "10.74.0.2", "private_key": "DO_NOT_ECHO_PRIVATE_KEY",
+			}},
+		}})
+	if privateField.Code != http.StatusBadRequest || bytes.Contains(privateField.Body.Bytes(), []byte("DO_NOT_ECHO_PRIVATE_KEY")) {
+		t.Fatalf("dry-run 必须拒绝私钥字段且不回显输入，得到 %d：%s", privateField.Code, privateField.Body.String())
+	}
+
+	adminNodes := testRequest(t, handler, http.MethodGet, "/v1/admin/nodes", adminToken, nil)
+	if adminNodes.Code != http.StatusOK {
+		t.Fatalf("读取 dry-run 状态失败：%d %s", adminNodes.Code, adminNodes.Body.String())
+	}
+	var listed []map[string]any
+	if err := json.Unmarshal(adminNodes.Body.Bytes(), &listed); err != nil || len(listed) != 1 {
+		t.Fatalf("解析节点 dry-run 摘要失败：%s (%v)", adminNodes.Body.String(), err)
+	}
+	if listed[0]["dry_run_status"] != "valid" || listed[0]["dry_run_added_count"] != float64(1) {
+		t.Fatalf("管理员节点列表未显示 dry-run 摘要：%v", listed[0])
+	}
+
+	// Simulate an inconsistent database state: revoked devices must invalidate
+	// the candidate instead of producing a plan that still contains that peer.
+	if _, err := api.db.Exec(ctx, `UPDATE devices SET revoked_at = NOW() WHERE id = $1`, deviceID); err != nil {
+		t.Fatalf("构造已撤销但仍分配的设备状态失败: %v", err)
+	}
+	invalid := dryRun(base)
+	if invalid.Code != http.StatusUnprocessableEntity || !bytes.Contains(invalid.Body.Bytes(), []byte("revoked_device_still_present")) {
+		t.Fatalf("含已撤销设备的候选应被拒绝，得到 %d：%s", invalid.Code, invalid.Body.String())
+	}
+
+	if _, err := api.db.Exec(ctx,
+		`UPDATE node_credentials SET revoked_at = NOW() WHERE node_id = $1 AND revoked_at IS NULL`, node.Node.ID,
+	); err != nil {
+		t.Fatalf("撤销节点凭据失败: %v", err)
+	}
+	if revoked := dryRun(base); revoked.Code != http.StatusUnauthorized {
+		t.Fatalf("撤销凭据后 dry-run 应返回 401，得到 %d：%s", revoked.Code, revoked.Body.String())
+	}
+}
+
 func TestListMySubscriptionsShowsHistoryAndOnlyOwnRecords(t *testing.T) {
 	api, userID, cleanup := testFixture(t)
 	defer cleanup()

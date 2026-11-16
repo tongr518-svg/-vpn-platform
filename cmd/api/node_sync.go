@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ type nodeConfigDevice struct {
 	Platform      string    `json:"platform"`
 	AssignedAt    time.Time `json:"assigned_at"`
 	TunnelAddress string    `json:"tunnel_address"`
+	Revoked       bool      `json:"-"`
 }
 
 type nodeConfigSnapshot struct {
@@ -28,6 +30,22 @@ type nodeConfigSnapshot struct {
 
 type acknowledgeNodeConfigRequest struct {
 	Version int64 `json:"version"`
+}
+
+type nodeConfigDryRunRequest struct {
+	ConfirmedSnapshot nodeConfigSnapshot `json:"confirmed_snapshot"`
+}
+
+type nodeConfigDryRunSummary struct {
+	ConfirmedVersion int64     `json:"confirmed_version"`
+	CandidateVersion int64     `json:"candidate_version"`
+	Status           string    `json:"status"`
+	AddedCount       int       `json:"added_count"`
+	ChangedCount     int       `json:"changed_count"`
+	RemovedCount     int       `json:"removed_count"`
+	NetworkChanged   bool      `json:"network_changed"`
+	ValidationErrors []string  `json:"validation_errors"`
+	CreatedAt        time.Time `json:"created_at,omitempty"`
 }
 
 // recordNodeConfigChange appends the outbox event and increments the desired
@@ -84,6 +102,49 @@ func nodeIDForCredential(ctx context.Context, tx pgx.Tx, tokenHash [32]byte) (in
 	return nodeID, desiredVersion, err
 }
 
+func loadNodeConfigSnapshot(ctx context.Context, tx pgx.Tx, nodeID, version int64) (nodeConfigSnapshot, error) {
+	snapshot := nodeConfigSnapshot{NodeID: nodeID, Version: version, Devices: make([]nodeConfigDevice, 0)}
+	var tunnelCIDR string
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE(tunnel_cidr::text, '') FROM nodes WHERE id = $1`, nodeID,
+	).Scan(&tunnelCIDR); err != nil {
+		return nodeConfigSnapshot{}, err
+	}
+	snapshot.TunnelCIDR = tunnelCIDR
+	if tunnelCIDR != "" {
+		prefix, _, err := parseTunnelPrefix(tunnelCIDR)
+		if err == nil {
+			snapshot.GatewayAddress = prefixAddress(prefix, 1).String()
+		}
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT d.id, d.public_key, d.platform, a.assigned_at,
+		        COALESCE(ta.address::text, ''), d.revoked_at IS NOT NULL
+		 FROM node_device_assignments a
+		 JOIN devices d ON d.id = a.device_id
+		 LEFT JOIN node_tunnel_addresses ta
+		   ON ta.node_id = a.node_id AND ta.device_id = a.device_id AND ta.state = 'assigned'
+		 WHERE a.node_id = $1
+		 ORDER BY d.id`,
+		nodeID,
+	)
+	if err != nil {
+		return nodeConfigSnapshot{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item nodeConfigDevice
+		if err := rows.Scan(&item.DeviceID, &item.PublicKey, &item.Platform, &item.AssignedAt, &item.TunnelAddress, &item.Revoked); err != nil {
+			return nodeConfigSnapshot{}, err
+		}
+		snapshot.Devices = append(snapshot.Devices, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nodeConfigSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
 func (a *API) nodeConfig(w http.ResponseWriter, r *http.Request) {
 	tokenHash, ok := nodeCredentialHash(r)
 	if !ok {
@@ -103,8 +164,8 @@ func (a *API) nodeConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 
-	var snapshot nodeConfigSnapshot
-	snapshot.NodeID, snapshot.Version, err = nodeIDForCredential(r.Context(), tx, tokenHash)
+	var nodeID, version int64
+	nodeID, version, err = nodeIDForCredential(r.Context(), tx, tokenHash)
 	if err == pgx.ErrNoRows {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
@@ -113,66 +174,139 @@ func (a *API) nodeConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
-	var tunnelCIDR string
-	if err := tx.QueryRow(r.Context(),
-		`SELECT COALESCE(tunnel_cidr::text, '') FROM nodes WHERE id = $1`, snapshot.NodeID,
-	).Scan(&tunnelCIDR); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
-		return
-	}
-	snapshot.TunnelCIDR = tunnelCIDR
-	if tunnelCIDR != "" {
-		prefix, _, parseErr := parseTunnelPrefix(tunnelCIDR)
-		if parseErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "invalid_node_tunnel_cidr"})
-			return
-		}
-		snapshot.GatewayAddress = prefixAddress(prefix, 1).String()
-	}
-
-	rows, err := tx.Query(r.Context(),
-		`SELECT d.id, d.public_key, d.platform, a.assigned_at, ta.address::text
-		 FROM node_device_assignments a
-		 JOIN devices d ON d.id = a.device_id
-		 LEFT JOIN node_tunnel_addresses ta
-		   ON ta.node_id = a.node_id AND ta.device_id = a.device_id AND ta.state = 'assigned'
-		 WHERE a.node_id = $1 AND d.revoked_at IS NULL
-		 ORDER BY d.id`,
-		snapshot.NodeID,
-	)
+	snapshot, err := loadNodeConfigSnapshot(r.Context(), tx, nodeID, version)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
-	snapshot.Devices = make([]nodeConfigDevice, 0)
-	for rows.Next() {
-		var item nodeConfigDevice
-		var tunnelAddress *string
-		if err := rows.Scan(&item.DeviceID, &item.PublicKey, &item.Platform, &item.AssignedAt, &tunnelAddress); err != nil {
-			rows.Close()
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
-			return
-		}
-		if tunnelAddress == nil {
-			rows.Close()
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "device_tunnel_address_missing"})
-			return
-		}
-		item.TunnelAddress = *tunnelAddress
-		snapshot.Devices = append(snapshot.Devices, item)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+	_, _, _, validationErrors := validatePlannerSnapshot(snapshot, true, nil)
+	if len(validationErrors) > 0 {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "node_config_validation_failed", "validation_errors": validationErrors,
+		})
 		return
 	}
-	rows.Close()
 	if err := tx.Commit(r.Context()); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, snapshot)
+}
+
+func (a *API) nodeConfigDryRun(w http.ResponseWriter, r *http.Request) {
+	tokenHash, ok := nodeCredentialHash(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	var in nodeConfigDryRunRequest
+	if !decodeJSON(w, r, &in) {
+		return
+	}
+	if in.ConfirmedSnapshot.Version < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_confirmed_version"})
+		return
+	}
+
+	tx, err := a.db.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	nodeID, desiredVersion, err := nodeIDForCredential(r.Context(), tx, tokenHash)
+	if err == pgx.ErrNoRows {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	var acknowledgedVersion int64
+	if err := tx.QueryRow(r.Context(), `SELECT acknowledged_config_version FROM nodes WHERE id = $1`, nodeID).Scan(&acknowledgedVersion); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	candidate, err := loadNodeConfigSnapshot(r.Context(), tx, nodeID, desiredVersion)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	confirmed := in.ConfirmedSnapshot
+	errors := make([]string, 0)
+	if confirmed.NodeID != nodeID {
+		errors = append(errors, "confirmed_node_id_mismatch")
+	}
+	if confirmed.Version != acknowledgedVersion {
+		errors = append(errors, "confirmed_version_not_current")
+	}
+	plan, plannerErrors := planWireGuardDryRun(confirmed, candidate, nil)
+	errors = append(errors, plannerErrors...)
+	sort.Strings(errors)
+	status := "valid"
+	if len(errors) > 0 {
+		status = "invalid"
+	}
+	summary := nodeConfigDryRunSummary{
+		ConfirmedVersion: confirmed.Version,
+		CandidateVersion: candidate.Version,
+		Status:           status,
+		ValidationErrors: errors,
+	}
+	if plan != nil {
+		summary.AddedCount = len(plan.Added)
+		summary.ChangedCount = len(plan.Changed)
+		summary.RemovedCount = len(plan.Removed)
+		summary.NetworkChanged = plan.NetworkChanged
+	}
+	if len(errors) > 0 {
+		plan = nil
+		summary.AddedCount = 0
+		summary.ChangedCount = 0
+		summary.RemovedCount = 0
+		summary.NetworkChanged = false
+	}
+	if err := tx.QueryRow(r.Context(),
+		`INSERT INTO node_config_dry_runs
+		 (node_id, confirmed_version, candidate_version, status,
+		  added_count, changed_count, removed_count, network_changed, validation_errors)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		 ON CONFLICT (node_id) DO UPDATE SET
+		   confirmed_version = EXCLUDED.confirmed_version,
+		   candidate_version = EXCLUDED.candidate_version,
+		   status = EXCLUDED.status,
+		   added_count = EXCLUDED.added_count,
+		   changed_count = EXCLUDED.changed_count,
+		   removed_count = EXCLUDED.removed_count,
+		   network_changed = EXCLUDED.network_changed,
+		   validation_errors = EXCLUDED.validation_errors,
+		   created_at = NOW()
+		 RETURNING created_at`,
+		nodeID, summary.ConfirmedVersion, summary.CandidateVersion, summary.Status,
+		summary.AddedCount, summary.ChangedCount, summary.RemovedCount, summary.NetworkChanged, summary.ValidationErrors,
+	).Scan(&summary.CreatedAt); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	if plan == nil {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error": "dry_run_validation_failed", "dry_run": summary,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"dry_run": summary,
+		"plan":    plan,
+		"applied": false,
+	})
 }
 
 func (a *API) acknowledgeNodeConfig(w http.ResponseWriter, r *http.Request) {

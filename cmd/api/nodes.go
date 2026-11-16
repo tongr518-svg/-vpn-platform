@@ -13,24 +13,33 @@ import (
 )
 
 type nodeRecord struct {
-	ID               int64      `json:"id"`
-	Name             string     `json:"name"`
-	Region           string     `json:"region"`
-	Status           string     `json:"status"`
-	HealthStatus     string     `json:"health_status"`
-	Capacity         int        `json:"capacity"`
-	AssignedDevices  int        `json:"assigned_device_count"`
-	TunnelCIDR       string     `json:"tunnel_cidr"`
-	AddressPoolSize  int64      `json:"address_pool_size"`
-	AddressAllocated int64      `json:"address_allocated"`
-	AddressAvailable int64      `json:"address_available"`
-	DesiredVersion   int64      `json:"desired_config_version"`
-	AckVersion       int64      `json:"acknowledged_config_version"`
-	SyncPending      bool       `json:"sync_pending"`
-	LastSyncAt       *time.Time `json:"last_sync_at,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
-	LastHeartbeatAt  *time.Time `json:"last_heartbeat_at,omitempty"`
-	CredentialActive bool       `json:"credential_active"`
+	ID                     int64      `json:"id"`
+	Name                   string     `json:"name"`
+	Region                 string     `json:"region"`
+	Status                 string     `json:"status"`
+	HealthStatus           string     `json:"health_status"`
+	Capacity               int        `json:"capacity"`
+	AssignedDevices        int        `json:"assigned_device_count"`
+	TunnelCIDR             string     `json:"tunnel_cidr"`
+	AddressPoolSize        int64      `json:"address_pool_size"`
+	AddressAllocated       int64      `json:"address_allocated"`
+	AddressAvailable       int64      `json:"address_available"`
+	DryRunStatus           string     `json:"dry_run_status"`
+	DryRunBaseVersion      int64      `json:"dry_run_confirmed_version"`
+	DryRunCandidateVersion int64      `json:"dry_run_candidate_version"`
+	DryRunAdded            int        `json:"dry_run_added_count"`
+	DryRunChanged          int        `json:"dry_run_changed_count"`
+	DryRunRemoved          int        `json:"dry_run_removed_count"`
+	DryRunNetworkChanged   bool       `json:"dry_run_network_changed"`
+	DryRunErrors           []string   `json:"dry_run_validation_errors"`
+	DryRunAt               *time.Time `json:"dry_run_at,omitempty"`
+	DesiredVersion         int64      `json:"desired_config_version"`
+	AckVersion             int64      `json:"acknowledged_config_version"`
+	SyncPending            bool       `json:"sync_pending"`
+	LastSyncAt             *time.Time `json:"last_sync_at,omitempty"`
+	CreatedAt              time.Time  `json:"created_at"`
+	LastHeartbeatAt        *time.Time `json:"last_heartbeat_at,omitempty"`
+	CredentialActive       bool       `json:"credential_active"`
 }
 
 type createNodeRequest struct {
@@ -62,6 +71,15 @@ const nodeSelectColumns = `id, name, region, status, capacity, created_at,
 	 JOIN devices d ON d.id = a.device_id
 	 WHERE a.node_id = nodes.id AND d.revoked_at IS NULL),
 	(SELECT COUNT(*)::bigint FROM node_tunnel_addresses ta WHERE ta.node_id = nodes.id),
+	COALESCE((SELECT status FROM node_config_dry_runs dr WHERE dr.node_id = nodes.id), 'not_run'),
+	COALESCE((SELECT confirmed_version FROM node_config_dry_runs dr WHERE dr.node_id = nodes.id), 0),
+	COALESCE((SELECT candidate_version FROM node_config_dry_runs dr WHERE dr.node_id = nodes.id), 0),
+	COALESCE((SELECT added_count FROM node_config_dry_runs dr WHERE dr.node_id = nodes.id), 0),
+	COALESCE((SELECT changed_count FROM node_config_dry_runs dr WHERE dr.node_id = nodes.id), 0),
+	COALESCE((SELECT removed_count FROM node_config_dry_runs dr WHERE dr.node_id = nodes.id), 0),
+	COALESCE((SELECT network_changed FROM node_config_dry_runs dr WHERE dr.node_id = nodes.id), FALSE),
+	COALESCE((SELECT validation_errors FROM node_config_dry_runs dr WHERE dr.node_id = nodes.id), ARRAY[]::text[]),
+	(SELECT created_at FROM node_config_dry_runs dr WHERE dr.node_id = nodes.id),
 	desired_config_version, acknowledged_config_version,
 	(acknowledged_config_version < desired_config_version), last_sync_at`
 
@@ -71,7 +89,10 @@ func scanNodeRecord(row interface{ Scan(...any) error }) (nodeRecord, error) {
 		&node.ID, &node.Name, &node.Region, &node.Status, &node.Capacity,
 		&node.CreatedAt, &node.LastHeartbeatAt, &node.TunnelCIDR,
 		&node.CredentialActive, &node.HealthStatus, &node.AssignedDevices,
-		&node.AddressAllocated, &node.DesiredVersion, &node.AckVersion,
+		&node.AddressAllocated, &node.DryRunStatus, &node.DryRunBaseVersion,
+		&node.DryRunCandidateVersion, &node.DryRunAdded, &node.DryRunChanged,
+		&node.DryRunRemoved, &node.DryRunNetworkChanged, &node.DryRunErrors, &node.DryRunAt,
+		&node.DesiredVersion, &node.AckVersion,
 		&node.SyncPending, &node.LastSyncAt,
 	)
 	if err != nil {
@@ -164,6 +185,8 @@ func (a *API) adminCreateNode(w http.ResponseWriter, r *http.Request) {
 	_, poolSize, _ := parseTunnelPrefix(prefix.String())
 	node.AddressPoolSize = int64(poolSize)
 	node.AddressAvailable = int64(poolSize)
+	node.DryRunStatus = "not_run"
+	node.DryRunErrors = []string{}
 	writeJSON(w, http.StatusCreated, map[string]any{"node": node, "credential": credential})
 }
 
