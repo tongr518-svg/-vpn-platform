@@ -10,11 +10,16 @@ import (
 )
 
 type adminDevice struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	Platform  string    `json:"platform"`
-	CreatedAt time.Time `json:"created_at"`
-	Revoked   bool      `json:"revoked"`
+	ID                  int64      `json:"id"`
+	Name                string     `json:"name"`
+	Platform            string     `json:"platform"`
+	CreatedAt           time.Time  `json:"created_at"`
+	Revoked             bool       `json:"revoked"`
+	AssignedNodeID      *int64     `json:"assigned_node_id,omitempty"`
+	AssignedNodeName    string     `json:"assigned_node_name,omitempty"`
+	AssignedNodeStatus  string     `json:"assigned_node_status,omitempty"`
+	AssignedNodeHealth  string     `json:"assigned_node_health_status,omitempty"`
+	AssignmentCreatedAt *time.Time `json:"assignment_created_at,omitempty"`
 }
 
 func (a *API) adminListUserDevices(w http.ResponseWriter, r *http.Request) {
@@ -39,9 +44,17 @@ func (a *API) adminListUserDevices(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := a.db.Query(r.Context(),
-		`SELECT id, name, platform, created_at, revoked_at IS NOT NULL
-		 FROM devices WHERE user_id = $1
-		 ORDER BY created_at DESC LIMIT 500`,
+		`SELECT d.id, d.name, d.platform, d.created_at, d.revoked_at IS NOT NULL,
+		        n.id, COALESCE(n.name, ''), COALESCE(n.status, ''),
+		        CASE WHEN n.id IS NULL THEN ''
+		             WHEN n.last_heartbeat_at > NOW() - INTERVAL '90 seconds' THEN 'online'
+		             ELSE 'offline' END,
+	        a.assigned_at
+		 FROM devices d
+		 LEFT JOIN node_device_assignments a ON a.device_id = d.id
+		 LEFT JOIN nodes n ON n.id = a.node_id
+		 WHERE d.user_id = $1
+		 ORDER BY d.created_at DESC LIMIT 500`,
 		userID,
 	)
 	if err != nil {
@@ -53,7 +66,11 @@ func (a *API) adminListUserDevices(w http.ResponseWriter, r *http.Request) {
 	devices := make([]adminDevice, 0)
 	for rows.Next() {
 		var d adminDevice
-		if err := rows.Scan(&d.ID, &d.Name, &d.Platform, &d.CreatedAt, &d.Revoked); err != nil {
+		if err := rows.Scan(
+			&d.ID, &d.Name, &d.Platform, &d.CreatedAt, &d.Revoked,
+			&d.AssignedNodeID, &d.AssignedNodeName, &d.AssignedNodeStatus,
+			&d.AssignedNodeHealth, &d.AssignmentCreatedAt,
+		); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 			return
 		}

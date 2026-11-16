@@ -223,6 +223,35 @@ func testPublicKey(n byte) string {
 	return base64.StdEncoding.EncodeToString(key)
 }
 
+func addTestDevice(t *testing.T, api *API, userID int64, name string, keyByte byte) int64 {
+	t.Helper()
+	var deviceID int64
+	err := api.db.QueryRow(context.Background(),
+		`INSERT INTO devices (user_id, name, platform, public_key)
+		 VALUES ($1, $2, 'windows', $3)
+		 RETURNING id`,
+		userID, name, testPublicKey(keyByte),
+	).Scan(&deviceID)
+	if err != nil {
+		t.Fatalf("创建测试设备失败: %v", err)
+	}
+	return deviceID
+}
+
+func addTestUser(t *testing.T, api *API, email string, status string) int64 {
+	t.Helper()
+	var userID int64
+	err := api.db.QueryRow(context.Background(),
+		`INSERT INTO users (email, password_hash, role, status)
+		 VALUES ($1, 'test-hash', 'user', $2) RETURNING id`,
+		email, status,
+	).Scan(&userID)
+	if err != nil {
+		t.Fatalf("创建测试用户失败: %v", err)
+	}
+	return userID
+}
+
 func TestDeviceRegistrationRequiresActiveSubscription(t *testing.T) {
 	api, userID, cleanup := testFixture(t)
 	defer cleanup()
@@ -569,6 +598,240 @@ func TestNodeCapacityCannotDropBelowAssignedDevices(t *testing.T) {
 	}
 	if capacity != 2 {
 		t.Fatalf("被拒绝的容量修改不应改变数据库，当前容量为 %d", capacity)
+	}
+}
+
+func TestAdminDeviceAssignmentChecksAndReleasesCapacity(t *testing.T) {
+	api, adminID, cleanup := testFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := api.db.Exec(ctx, `UPDATE users SET role = 'admin' WHERE id = $1`, adminID); err != nil {
+		t.Fatalf("设置测试管理员失败: %v", err)
+	}
+	adminToken := testToken(t, api, adminID)
+	handler := testRouter(api)
+	targetUserID := addTestUser(t, api, "target@example.test", "active")
+	otherUserID := addTestUser(t, api, "other@example.test", "active")
+	addActiveTestPlan(t, api, targetUserID, 2)
+	addActiveTestPlan(t, api, otherUserID, 2)
+	firstDeviceID := addTestDevice(t, api, targetUserID, "first", 40)
+	secondDeviceID := addTestDevice(t, api, otherUserID, "second", 41)
+
+	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
+		map[string]any{"name": "assignment-node", "region": "test", "capacity": 1})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("创建节点失败，得到 %d：%s", created.Code, created.Body.String())
+	}
+	var nodePayload struct {
+		Node struct {
+			ID int64 `json:"id"`
+		} `json:"node"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &nodePayload); err != nil {
+		t.Fatalf("解析节点响应失败: %v", err)
+	}
+	nodeID := nodePayload.Node.ID
+
+	// A normal account cannot assign even another user's device.
+	denied := testRequest(t, handler, http.MethodPut,
+		fmt.Sprintf("/v1/admin/devices/%d/assignment", firstDeviceID),
+		testToken(t, api, otherUserID), map[string]int64{"node_id": nodeID})
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("普通用户跨账号分配应返回 403，得到 %d：%s", denied.Code, denied.Body.String())
+	}
+
+	assign := func(deviceID int64) *httptest.ResponseRecorder {
+		t.Helper()
+		return testRequest(t, handler, http.MethodPut,
+			fmt.Sprintf("/v1/admin/devices/%d/assignment", deviceID), adminToken,
+			map[string]int64{"node_id": nodeID})
+	}
+	unassign := func(deviceID int64) *httptest.ResponseRecorder {
+		t.Helper()
+		return testRequest(t, handler, http.MethodDelete,
+			fmt.Sprintf("/v1/admin/devices/%d/assignment", deviceID), adminToken, nil)
+	}
+
+	first := assign(firstDeviceID)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("有效设备分配应返回 201，得到 %d：%s", first.Code, first.Body.String())
+	}
+	full := assign(secondDeviceID)
+	if full.Code != http.StatusConflict {
+		t.Fatalf("容量已满时分配应返回 409，得到 %d：%s", full.Code, full.Body.String())
+	}
+
+	// Removing an assignment releases node capacity without revoking the device.
+	removed := unassign(firstDeviceID)
+	if removed.Code != http.StatusNoContent {
+		t.Fatalf("解除分配应返回 204，得到 %d：%s", removed.Code, removed.Body.String())
+	}
+	var revoked bool
+	if err := api.db.QueryRow(ctx, `SELECT revoked_at IS NOT NULL FROM devices WHERE id = $1`, firstDeviceID).Scan(&revoked); err != nil {
+		t.Fatalf("检查设备撤销状态失败: %v", err)
+	}
+	if revoked {
+		t.Fatal("解除节点分配不应撤销设备")
+	}
+	second := assign(secondDeviceID)
+	if second.Code != http.StatusCreated {
+		t.Fatalf("释放容量后应能分配第二台设备，得到 %d：%s", second.Code, second.Body.String())
+	}
+
+	devices := testRequest(t, handler, http.MethodGet,
+		fmt.Sprintf("/v1/admin/users/%d/devices", otherUserID), adminToken, nil)
+	if devices.Code != http.StatusOK || bytes.Contains(devices.Body.Bytes(), []byte("public_key")) {
+		t.Fatalf("管理员设备列表应显示分配信息但不返回密钥，得到 %d：%s", devices.Code, devices.Body.String())
+	}
+	var deviceList []map[string]any
+	if err := json.Unmarshal(devices.Body.Bytes(), &deviceList); err != nil || len(deviceList) != 1 {
+		t.Fatalf("解析管理员设备列表失败：%s (%v)", devices.Body.String(), err)
+	}
+	if deviceList[0]["assigned_node_id"] != float64(nodeID) || deviceList[0]["assigned_node_status"] != "active" {
+		t.Fatalf("设备列表没有显示节点分配状态：%v", deviceList[0])
+	}
+
+	if _, err := api.db.Exec(ctx, `UPDATE nodes SET status = 'maintenance' WHERE id = $1`, nodeID); err != nil {
+		t.Fatalf("设置节点维护状态失败: %v", err)
+	}
+	removed = unassign(secondDeviceID)
+	if removed.Code != http.StatusNoContent {
+		t.Fatalf("解除第二台设备分配应返回 204，得到 %d：%s", removed.Code, removed.Body.String())
+	}
+	maintenanceDenied := assign(firstDeviceID)
+	if maintenanceDenied.Code != http.StatusConflict {
+		t.Fatalf("维护节点不可接受新分配，应返回 409，得到 %d：%s", maintenanceDenied.Code, maintenanceDenied.Body.String())
+	}
+
+	var auditCount int
+	if err := api.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM admin_audit_logs
+		 WHERE actor_user_id = $1 AND action IN ('assign_device_node', 'unassign_device_node')`, adminID,
+	).Scan(&auditCount); err != nil {
+		t.Fatalf("查询分配审计记录失败: %v", err)
+	}
+	if auditCount != 4 {
+		t.Fatalf("两次分配和两次解除应有 4 条审计记录，实际为 %d", auditCount)
+	}
+}
+
+func TestDeviceAssignmentRequiresActiveUserAndSubscription(t *testing.T) {
+	api, adminID, cleanup := testFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := api.db.Exec(ctx, `UPDATE users SET role = 'admin' WHERE id = $1`, adminID); err != nil {
+		t.Fatalf("设置测试管理员失败: %v", err)
+	}
+	adminToken := testToken(t, api, adminID)
+	handler := testRouter(api)
+
+	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
+		map[string]any{"name": "eligibility-node", "region": "test", "capacity": 10})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("创建节点失败，得到 %d：%s", created.Code, created.Body.String())
+	}
+	var nodePayload struct {
+		Node struct {
+			ID int64 `json:"id"`
+		} `json:"node"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &nodePayload); err != nil {
+		t.Fatalf("解析节点响应失败: %v", err)
+	}
+	nodeID := nodePayload.Node.ID
+	assign := func(deviceID int64) *httptest.ResponseRecorder {
+		t.Helper()
+		return testRequest(t, handler, http.MethodPut,
+			fmt.Sprintf("/v1/admin/devices/%d/assignment", deviceID), adminToken,
+			map[string]int64{"node_id": nodeID})
+	}
+
+	noPlanUser := addTestUser(t, api, "no-plan@example.test", "active")
+	noPlanDevice := addTestDevice(t, api, noPlanUser, "no-plan", 42)
+	if response := assign(noPlanDevice); response.Code != http.StatusForbidden {
+		t.Fatalf("无有效订阅的设备应被拒绝，得到 %d：%s", response.Code, response.Body.String())
+	}
+
+	suspendedUser := addTestUser(t, api, "suspended@example.test", "suspended")
+	addActiveTestPlan(t, api, suspendedUser, 2)
+	suspendedDevice := addTestDevice(t, api, suspendedUser, "suspended", 43)
+	if response := assign(suspendedDevice); response.Code != http.StatusConflict {
+		t.Fatalf("暂停账号设备应被拒绝，得到 %d：%s", response.Code, response.Body.String())
+	}
+
+	activeUser := addTestUser(t, api, "active-device@example.test", "active")
+	addActiveTestPlan(t, api, activeUser, 2)
+	revokedDevice := addTestDevice(t, api, activeUser, "revoked", 44)
+	if _, err := api.db.Exec(ctx, `UPDATE devices SET revoked_at = NOW() WHERE id = $1`, revokedDevice); err != nil {
+		t.Fatalf("撤销测试设备失败: %v", err)
+	}
+	if response := assign(revokedDevice); response.Code != http.StatusConflict {
+		t.Fatalf("已撤销设备应被拒绝，得到 %d：%s", response.Code, response.Body.String())
+	}
+}
+
+func TestConcurrentDeviceAssignmentsRespectNodeCapacity(t *testing.T) {
+	api, adminID, cleanup := testFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := api.db.Exec(ctx, `UPDATE users SET role = 'admin' WHERE id = $1`, adminID); err != nil {
+		t.Fatalf("设置测试管理员失败: %v", err)
+	}
+	addActiveTestPlan(t, api, adminID, 5)
+	adminToken := testToken(t, api, adminID)
+	handler := testRouter(api)
+	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
+		map[string]any{"name": "concurrent-node", "region": "test", "capacity": 1})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("创建节点失败，得到 %d：%s", created.Code, created.Body.String())
+	}
+	var nodePayload struct {
+		Node struct {
+			ID int64 `json:"id"`
+		} `json:"node"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &nodePayload); err != nil {
+		t.Fatalf("解析节点响应失败: %v", err)
+	}
+	deviceIDs := []int64{
+		addTestDevice(t, api, adminID, "concurrent-a", 45),
+		addTestDevice(t, api, adminID, "concurrent-b", 46),
+	}
+	statuses := make(chan int, len(deviceIDs))
+	var wg sync.WaitGroup
+	for _, deviceID := range deviceIDs {
+		deviceID := deviceID
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			response := testRequest(t, handler, http.MethodPut,
+				fmt.Sprintf("/v1/admin/devices/%d/assignment", deviceID), adminToken,
+				map[string]int64{"node_id": nodePayload.Node.ID})
+			statuses <- response.Code
+		}()
+	}
+	wg.Wait()
+	close(statuses)
+	createdCount, conflictCount := 0, 0
+	for status := range statuses {
+		switch status {
+		case http.StatusCreated:
+			createdCount++
+		case http.StatusConflict:
+			conflictCount++
+		default:
+			t.Fatalf("并发分配返回意外状态码 %d", status)
+		}
+	}
+	if createdCount != 1 || conflictCount != 1 {
+		t.Fatalf("容量为 1 时应有一次成功、一次冲突，实际成功 %d、冲突 %d", createdCount, conflictCount)
+	}
+	var assignedCount int
+	if err := api.db.QueryRow(ctx, `SELECT COUNT(*) FROM node_device_assignments WHERE node_id = $1`, nodePayload.Node.ID).Scan(&assignedCount); err != nil {
+		t.Fatalf("查询节点分配数失败: %v", err)
+	}
+	if assignedCount != 1 {
+		t.Fatalf("并发分配后节点记录数应为 1，实际为 %d", assignedCount)
 	}
 }
 

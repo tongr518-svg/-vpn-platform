@@ -34,6 +34,8 @@ func newRouter(api *API) http.Handler {
 	mux.HandleFunc("DELETE /v1/admin/invites/{id}", api.adminRevokeInvite)
 	mux.HandleFunc("GET /v1/admin/users/{id}/devices", api.adminListUserDevices)
 	mux.HandleFunc("DELETE /v1/admin/users/{id}/devices/{deviceID}", api.adminRevokeUserDevice)
+	mux.HandleFunc("PUT /v1/admin/devices/{id}/assignment", api.adminAssignDeviceToNode)
+	mux.HandleFunc("DELETE /v1/admin/devices/{id}/assignment", api.adminUnassignDeviceFromNode)
 	mux.HandleFunc("GET /v1/admin/nodes", api.adminListNodes)
 	mux.HandleFunc("POST /v1/admin/nodes", api.adminCreateNode)
 	mux.HandleFunc("PATCH /v1/admin/nodes/{id}", api.adminUpdateNode)

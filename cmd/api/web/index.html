@@ -65,7 +65,7 @@
         <button id="closeDevicePanel" type="button">关闭</button>
       </div>
       <table>
-        <thead><tr><th>ID</th><th>名称</th><th>平台</th><th>登记时间</th><th>状态</th><th>操作</th></tr></thead>
+        <thead><tr><th>ID</th><th>名称</th><th>平台</th><th>登记时间</th><th>设备状态</th><th>节点分配</th><th>操作</th></tr></thead>
         <tbody id="devicesBody"></tbody>
       </table>
     </section>
@@ -263,11 +263,14 @@
     body.replaceChildren();
 
     try {
-      const devices = await api(`/v1/admin/users/${user.id}/devices`);
+      const [devices, nodes] = await Promise.all([
+        api(`/v1/admin/users/${user.id}/devices`),
+        api("/v1/admin/nodes")
+      ]);
       if (devices.length === 0) {
         const tr = document.createElement("tr");
         const td = cell(tr, "暂无设备");
-        td.colSpan = 6;
+        td.colSpan = 7;
         body.appendChild(tr);
         return;
       }
@@ -278,7 +281,53 @@
         cell(tr, device.platform);
         cell(tr, dateText(device.created_at));
         cell(tr, device.revoked ? "已撤销" : "有效");
+        const assignmentText = device.assigned_node_id == null
+          ? "未分配"
+          : `${device.assigned_node_name}（管理：${device.assigned_node_status}；健康：${device.assigned_node_health_status}）`;
+        cell(tr, assignmentText);
         const td = document.createElement("td");
+        if (device.assigned_node_id != null) {
+          const unassignButton = document.createElement("button");
+          unassignButton.textContent = "解除分配";
+          unassignButton.addEventListener("click", async () => {
+            if (!confirm(`解除设备“${device.name}”的节点分配？设备登记不会被撤销。`)) return;
+            unassignButton.disabled = true;
+            try {
+              await api(`/v1/admin/devices/${device.id}/assignment`, { method: "DELETE" });
+              message("设备节点分配已解除");
+              await loadUserDevices(user);
+            } catch (error) { handleAuthError(error); }
+            finally { unassignButton.disabled = false; }
+          });
+          td.appendChild(unassignButton);
+        } else if (!device.revoked) {
+          const activeNodes = nodes.filter(node => node.status === "active");
+          const nodeSelect = document.createElement("select");
+          nodeSelect.add(new Option("选择活动节点", ""));
+          for (const node of activeNodes) {
+            nodeSelect.add(new Option(`${node.name}（${node.region}，${node.assigned_device_count}/${node.capacity}）`, String(node.id)));
+          }
+          const assignButton = document.createElement("button");
+          assignButton.textContent = "分配节点";
+          assignButton.disabled = activeNodes.length === 0;
+          assignButton.addEventListener("click", async () => {
+            const nodeId = Number(nodeSelect.value);
+            if (!nodeId) {
+              message("请先选择节点", true);
+              return;
+            }
+            assignButton.disabled = true;
+            try {
+              await api(`/v1/admin/devices/${device.id}/assignment`, {
+                method: "PUT", body: JSON.stringify({ node_id: nodeId })
+              });
+              message("设备已分配到节点");
+              await loadUserDevices(user);
+            } catch (error) { handleAuthError(error); }
+            finally { assignButton.disabled = false; }
+          });
+          td.append(nodeSelect, assignButton);
+        }
         if (!device.revoked) {
           const button = document.createElement("button");
           button.textContent = "撤销设备";
