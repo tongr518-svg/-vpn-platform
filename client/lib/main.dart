@@ -534,7 +534,9 @@ class _ClientHomeState extends State<ClientHome> {
       final keyPairData = await keyPair.extract();
       final publicKey = await keyPair.extractPublicKey();
       final publicKeyBase64 = base64Encode(publicKey.bytes);
-      final privateKeyBase64 = base64Encode(keyPairData.privateKey);
+      final privateKeyBase64 = base64Encode(keyPairData.bytes);
+      keyPairData.destroy();
+      keyPair.destroy();
 
       // The private key is written to system secure storage and never sent to the API.
       final storageKey = 'wg_private_$publicKeyBase64';
