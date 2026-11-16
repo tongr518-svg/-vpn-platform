@@ -1,8 +1,22 @@
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:vpn_platform_client/main.dart';
 
+const _secureStorageChannel =
+    MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
+
 void main() {
+  setUp(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_secureStorageChannel, (call) async => null);
+  });
+
+  tearDown(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_secureStorageChannel, null);
+  });
+
   testWidgets('demo mode shows synthetic read-only account UI', (tester) async {
     await tester.pumpWidget(const VpnClientApp());
     await tester.pumpAndSettle();
