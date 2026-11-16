@@ -115,7 +115,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          output="$(flutter test 2>&1)"
+          output="$(flutter test --reporter expanded 2>&1)"
           result=$?
           printf '%s\n' "$output"
           if [ "$result" -ne 0 ]; then
