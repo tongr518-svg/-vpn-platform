@@ -33,6 +33,9 @@ type nodeRecord struct {
 	DryRunNetworkChanged   bool       `json:"dry_run_network_changed"`
 	DryRunErrors           []string   `json:"dry_run_validation_errors"`
 	DryRunAt               *time.Time `json:"dry_run_at,omitempty"`
+	ApprovalStatus         string     `json:"config_approval_status"`
+	ApprovalVersion        int64      `json:"config_approval_version"`
+	ApprovalExpiresAt      *time.Time `json:"config_approval_expires_at,omitempty"`
 	DesiredVersion         int64      `json:"desired_config_version"`
 	AckVersion             int64      `json:"acknowledged_config_version"`
 	SyncPending            bool       `json:"sync_pending"`
@@ -80,6 +83,24 @@ const nodeSelectColumns = `id, name, region, status, capacity, created_at,
 	COALESCE((SELECT network_changed FROM node_config_dry_runs dr WHERE dr.node_id = nodes.id), FALSE),
 	COALESCE((SELECT validation_errors FROM node_config_dry_runs dr WHERE dr.node_id = nodes.id), ARRAY[]::text[]),
 	(SELECT created_at FROM node_config_dry_runs dr WHERE dr.node_id = nodes.id),
+	COALESCE((SELECT CASE WHEN consumed_at IS NOT NULL THEN 'verified'
+	                      WHEN expires_at <= NOW() THEN 'expired'
+	                      ELSE 'approved' END
+	          FROM node_config_approvals a
+	          WHERE a.node_id = nodes.id AND a.candidate_version = nodes.desired_config_version
+	            AND a.candidate_digest = (SELECT candidate_digest FROM node_config_dry_runs dr
+	                                      WHERE dr.node_id = nodes.id AND dr.status = 'valid')
+	          ORDER BY a.id DESC LIMIT 1), 'not_approved'),
+	COALESCE((SELECT candidate_version FROM node_config_approvals a
+	          WHERE a.node_id = nodes.id AND a.candidate_version = nodes.desired_config_version
+	            AND a.candidate_digest = (SELECT candidate_digest FROM node_config_dry_runs dr
+	                                      WHERE dr.node_id = nodes.id AND dr.status = 'valid')
+	          ORDER BY a.id DESC LIMIT 1), 0),
+	(SELECT expires_at FROM node_config_approvals a
+	 WHERE a.node_id = nodes.id AND a.candidate_version = nodes.desired_config_version
+	   AND a.candidate_digest = (SELECT candidate_digest FROM node_config_dry_runs dr
+	                            WHERE dr.node_id = nodes.id AND dr.status = 'valid')
+	 ORDER BY a.id DESC LIMIT 1),
 	desired_config_version, acknowledged_config_version,
 	(acknowledged_config_version < desired_config_version), last_sync_at`
 
@@ -92,6 +113,7 @@ func scanNodeRecord(row interface{ Scan(...any) error }) (nodeRecord, error) {
 		&node.AddressAllocated, &node.DryRunStatus, &node.DryRunBaseVersion,
 		&node.DryRunCandidateVersion, &node.DryRunAdded, &node.DryRunChanged,
 		&node.DryRunRemoved, &node.DryRunNetworkChanged, &node.DryRunErrors, &node.DryRunAt,
+		&node.ApprovalStatus, &node.ApprovalVersion, &node.ApprovalExpiresAt,
 		&node.DesiredVersion, &node.AckVersion,
 		&node.SyncPending, &node.LastSyncAt,
 	)

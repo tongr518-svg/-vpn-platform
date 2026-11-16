@@ -90,9 +90,13 @@ JWT 有效期为 12 小时。账号暂停或 `token_version` 变化后，旧 JWT
 | `PATCH` | `/v1/admin/nodes/{id}/status` | 设置 `active`、`maintenance` 或 `disabled` |
 | `POST` | `/v1/admin/nodes/{id}/credentials/rotate` | 轮换节点凭据，旧凭据立即失效，新凭据只返回一次 |
 | `DELETE` | `/v1/admin/nodes/{id}/credentials` | 撤销节点凭据 |
+| `POST` | `/v1/admin/nodes/{id}/config-approvals` | 批准指定的当前有效 dry-run 候选版本并签发短期签名审批 |
 | `POST` | `/v1/node/heartbeat` | 节点使用专属 Bearer 凭据上报健康状态 |
 | `GET` | `/v1/node/config` | 节点凭据拉取本节点当前期望快照及版本 |
 | `POST` | `/v1/node/config/dry-run` | 节点凭据提交已确认快照，服务端只校验并返回候选 peer 差异，不应用配置 |
+| `GET` | `/v1/node/config/signing-key` | 节点凭据获取 Ed25519 公钥；Agent 必须使用部署时固定的公钥验证签名 |
+| `GET` | `/v1/node/config/approval` | 获取当前节点、版本和候选摘要匹配的未过期审批包 |
+| `POST` | `/v1/node/config/approval/verify` | Agent 提交本地验证过的审批包；服务端核验签名并一次性消费 nonce |
 | `POST` | `/v1/node/config/ack` | 节点确认已应用的快照版本，请求体为 `{"version": 1}` |
 
 用户状态请求体为 `{"status":"active"}` 或 `{"status":"suspended"}`；套餐启停请求体为 `{"active":true}` 或 `{"active":false}`。创建套餐字段为 `name`、`device_limit`、`concurrent_limit`、`data_limit_bytes`、`speed_limit_mbps`；流量和速度限制设为 `0` 表示不限。订阅开通字段为 `plan_id`、`starts_at`、`ends_at`，时间使用 RFC 3339 格式。
@@ -113,7 +117,11 @@ JWT 有效期为 12 小时。账号暂停或 `token_version` 变化后，旧 JWT
 
 Agent 可用 `POST /v1/node/config/dry-run` 提交 `{"confirmed_snapshot": <此前已确认的完整快照>}`。服务端确认基线版本等于当前已确认版本，再以当前期望快照作为候选输入进行纯元数据规划；响应包含 `added`、`changed`、`removed` peer 列表及地址池变化。验证失败返回 `422 dry_run_validation_failed`，不返回候选计划。相同版本、相同快照得到稳定结果；候选版本低于基线、快照结构/地址无效、地址冲突、仍含已撤销设备或同版本内容不一致都会被拒绝。计划只含设备 ID、公钥和地址等公开 peer 元数据，没有 WireGuard 私钥或可直接应用的配置文本。
 
-管理员节点列表仅显示最近一次 dry-run 的基线/候选版本、差异计数、校验状态和错误摘要。dry-run 不会修改期望/确认版本、outbox、节点配置或地址分配；后台没有应用按钮。Agent 仍需在隔离环境自行评估计划，服务端此阶段不会调用 `wg` 或连接节点配置接口。
+管理员节点列表仅显示最近一次 dry-run 的基线/候选版本、差异计数、校验状态和错误摘要。dry-run 保存由候选快照规范化 JSON 计算的 SHA-256 摘要；摘要不包含私钥。
+
+管理员可提交 `{"candidate_version": 3}` 到节点审批接口。服务端仅接受与节点当前期望版本、最近一次有效 dry-run 和重新读取的候选快照摘要一致的审批；成功后使用服务端 Ed25519 私钥签发 10 分钟有效的一次性审批包，并在同一事务写入管理员审计记录。相同审批请求在仍有效时幂等返回原审批；候选版本或摘要变化后，旧审批无法再被 Agent 获取或验证。签名内容绑定节点 ID、候选版本、快照摘要、签发/过期时间和随机 nonce。
+
+Agent 应使用部署时固定的 Ed25519 公钥，在本地验证签名、目标节点 ID、当前 dry-run 版本和到期时间；`GET /v1/node/config/signing-key` 只便于查询公钥，不能作为未验证链路上的信任根。随后 Agent 可将审批包提交至 verify 接口；服务端再次核对签名、当前候选并原子消费 nonce，重复提交返回 `409 approval_replayed`。签名无效、版本/节点不符、候选已变化或审批过期均被拒绝。此流程只验证并消费审批，不应用配置；响应明确为 `applied: false`，后台没有配置应用按钮。服务端不会调用 `wg` 或连接节点配置接口。
 
 解除分配或撤销设备后，对应地址会保持 `releasing` 并计入占用，直到 Agent 确认包含移除的配置版本；确认时服务端在事务中释放地址，之后才可复用。节点离线、同步失败或轮换凭据不会释放地址。变更节点 CIDR 需要先清空分配，并等待所有释放版本确认。迁移前创建的旧分配没有隧道地址；需在使用快照前解除并重新分配这些设备。此控制面仍不生成 WireGuard 配置、不建立隧道或转发用户流量。
 
@@ -141,8 +149,10 @@ Agent 可用 `POST /v1/node/config/dry-run` 提交 `{"confirmed_snapshot": <此�
 | `422` | dry-run 基线或候选快照校验失败；不会返回候选计划 |
 | `429` | 请求超过 IP 限流额度；响应包含 `Retry-After` |
 | `500` | 服务内部错误 |
-| `503` | `/healthz` 检查时数据库不可用 |
+| `503` | 数据库健康检查失败或服务端未配置候选签名密钥 |
 
 错误码会随接口校验阶段而异；请以实际 handler 的响应为准，接口实现变化时同步更新本文档。
 
-当前 API 只管理账号、设备登记信息、套餐和订阅，不建立 VPN 隧道，也不处理支付。
+签名配置密钥由 `CONFIG_SIGNING_SECRET` 派生，须与 JWT 密钥分开设置并通过密钥管理方式保存。签名审批包仅含节点 ID、版本、候选摘要、期限、nonce 和签名；审计记录只含管理员、动作及审批 ID，不保存密钥材料。
+
+当前 API 仍不应用 WireGuard 配置、不建立 VPN 隧道、不转发用户流量，也不处理支付。

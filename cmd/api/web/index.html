@@ -147,7 +147,7 @@
       </form>
       <p class="muted">节点凭据仅在创建或轮换时显示一次。dry-run 只校验候选差异，不应用配置；此版本不配置隧道或转发流量。</p>
       <table>
-        <thead><tr><th>ID</th><th>名称</th><th>区域</th><th>管理状态</th><th>健康状态</th><th>设备容量</th><th>隧道地址池</th><th>期望/确认版本</th><th>dry-run 校验</th><th>同步状态</th><th>最后同步</th><th>最近心跳</th><th>凭据</th><th>操作</th></tr></thead>
+        <thead><tr><th>ID</th><th>名称</th><th>区域</th><th>管理状态</th><th>健康状态</th><th>设备容量</th><th>隧道地址池</th><th>期望/确认版本</th><th>dry-run 校验</th><th>候选审批</th><th>同步状态</th><th>最后同步</th><th>最近心跳</th><th>凭据</th><th>操作</th></tr></thead>
         <tbody id="nodesBody"></tbody>
       </table>
     </section>
@@ -499,6 +499,8 @@
         ` v${node.dry_run_confirmed_version}→v${node.dry_run_candidate_version} (+${node.dry_run_added_count} ~${node.dry_run_changed_count} -${node.dry_run_removed_count})`;
       const networkDiff = node.dry_run_network_changed ? " · 地址池变化" : "";
       cell(tr, `${dryRunStatus}${dryRunVersions}${networkDiff}${node.dry_run_at ? ` · ${dateText(node.dry_run_at)}` : ""}`);
+      const approvalLabel = { not_approved: "未批准", approved: "已批准", verified: "Agent 已验证", expired: "已过期" }[node.config_approval_status] || node.config_approval_status;
+      cell(tr, `${approvalLabel}${node.config_approval_version ? ` v${node.config_approval_version}` : ""}${node.config_approval_expires_at ? ` · ${dateText(node.config_approval_expires_at)}` : ""}`);
       cell(tr, node.sync_pending ? "待同步" : "已同步");
       cell(tr, dateText(node.last_sync_at) || "尚未确认");
       cell(tr, dateText(node.last_heartbeat_at) || "尚无心跳");
@@ -519,6 +521,25 @@
         } catch (error) { handleAuthError(error); }
       });
       td.appendChild(status);
+
+      if (node.dry_run_status === "valid" &&
+          node.dry_run_candidate_version === node.desired_config_version &&
+          node.config_approval_status !== "approved" &&
+          node.config_approval_status !== "verified") {
+        const approve = document.createElement("button");
+        approve.textContent = "批准候选版本";
+        approve.addEventListener("click", async () => {
+          if (!confirm(`批准节点 ${node.id} 的候选配置 v${node.dry_run_candidate_version}？这只签发短期审批，不会应用配置。`)) return;
+          try {
+            await api(`/v1/admin/nodes/${node.id}/config-approvals`, {
+              method: "POST", body: JSON.stringify({ candidate_version: node.dry_run_candidate_version })
+            });
+            message(`节点 ${node.id} 候选版本已批准；审批有效 10 分钟，不会应用配置`);
+            await loadNodes();
+          } catch (error) { handleAuthError(error); }
+        });
+        td.appendChild(approve);
+      }
 
       const edit = document.createElement("button");
       edit.textContent = "编辑元数据";

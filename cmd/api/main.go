@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -23,9 +24,10 @@ import (
 )
 
 type API struct {
-	db         *pgxpool.Pool
-	jwtSecret  []byte
-	inviteCode string
+	db               *pgxpool.Pool
+	jwtSecret        []byte
+	inviteCode       string
+	configSigningKey ed25519.PrivateKey
 }
 
 type accessClaims struct {
@@ -65,8 +67,13 @@ func main() {
 	databaseURL := requiredEnv("DATABASE_URL")
 	jwtSecret := requiredEnv("JWT_SECRET")
 	inviteCode := requiredEnv("INVITE_CODE")
+	configSigningSecret := requiredEnv("CONFIG_SIGNING_SECRET")
 	if len(jwtSecret) < 32 {
 		log.Fatal("JWT_SECRET 至少需要 32 个字符")
+	}
+	configSigningKey, err := deriveConfigSigningKey(configSigningSecret)
+	if err != nil {
+		log.Fatal("CONFIG_SIGNING_SECRET 至少需要 32 个字符")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -85,7 +92,7 @@ func main() {
 		log.Fatal("数据库迁移失败：", err)
 	}
 
-	api := &API{db: db, jwtSecret: []byte(jwtSecret), inviteCode: inviteCode}
+	api := &API{db: db, jwtSecret: []byte(jwtSecret), inviteCode: inviteCode, configSigningKey: configSigningKey}
 
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {

@@ -81,6 +81,7 @@ func testFixture(t *testing.T) (*API, int64, func()) {
 		jwtSecret:  []byte("integration-test-secret-at-least-32-bytes"),
 		inviteCode: "test-invite",
 	}
+	api.configSigningKey, _ = deriveConfigSigningKey("integration-test-config-signing-secret-at-least-32-bytes")
 
 	var userID int64
 	err = db.QueryRow(ctx,

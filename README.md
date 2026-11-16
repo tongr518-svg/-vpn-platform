@@ -1,6 +1,6 @@
 # VPN Platform 本地开发指南
 
-本项目包含 PostgreSQL、Go 控制面 API、嵌入式 Web 管理后台和 Flutter 客户端源码。当前版本只管理账号、设备登记信息、套餐与订阅；**不建立 VPN 隧道、不接入节点或支付**。
+本项目包含 PostgreSQL、Go 控制面 API、嵌入式 Web 管理后台和 Flutter 客户端源码。当前版本包含节点元数据、设备分配、快照 dry-run 和候选审批控制面；**不应用 WireGuard 配置、不建立 VPN 隧道、不转发用户流量，也不接入支付**。
 
 API 和 PostgreSQL 端口只绑定到 `127.0.0.1`。这是本地开发配置，不要直接暴露到公网。
 
@@ -13,7 +13,17 @@ cd D:\vpn-platform
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
-`POSTGRES_PASSWORD` 建议使用 URL 安全字符；如果含有 URL 特殊字符，需要在数据库连接 URL 中编码。`JWT_SECRET` 至少 32 个字符。不要提交 `.env`。
+`POSTGRES_PASSWORD` 建议使用 URL 安全字符；如果含有 URL 特殊字符，需要在数据库连接 URL 中编码。`JWT_SECRET` 和 `CONFIG_SIGNING_SECRET` 至少 32 个字符；签名密钥与 JWT 密钥应使用不同随机值。`CONFIG_SIGNING_SECRET` 用于派生 Ed25519 候选审批签名密钥，不能提交到 Git 或写入日志。不要提交 `.env`。
+
+可在本机 PowerShell 生成 `CONFIG_SIGNING_SECRET`：
+
+```powershell
+$randomBytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($randomBytes)
+[Convert]::ToBase64String($randomBytes)
+```
+
+将输出值写入本机 `.env`，不要粘贴到聊天、源码或文档。Agent 使用的 Ed25519 公钥应通过受信任的部署流程固定配置；不能把 Agent 临时从未验证连接取得的公钥当作信任根。
 
 ## 启动和停止
 

@@ -42,9 +42,13 @@ func newRouter(api *API) http.Handler {
 	mux.HandleFunc("PATCH /v1/admin/nodes/{id}/status", api.adminSetNodeStatus)
 	mux.HandleFunc("POST /v1/admin/nodes/{id}/credentials/rotate", api.adminRotateNodeCredential)
 	mux.HandleFunc("DELETE /v1/admin/nodes/{id}/credentials", api.adminRevokeNodeCredential)
+	mux.HandleFunc("POST /v1/admin/nodes/{id}/config-approvals", api.adminApproveNodeConfig)
 	mux.HandleFunc("POST /v1/node/heartbeat", api.nodeHeartbeat)
 	mux.HandleFunc("GET /v1/node/config", api.nodeConfig)
 	mux.HandleFunc("POST /v1/node/config/dry-run", api.nodeConfigDryRun)
+	mux.HandleFunc("GET /v1/node/config/signing-key", api.nodeConfigSigningKey)
+	mux.HandleFunc("GET /v1/node/config/approval", api.nodeGetConfigApproval)
+	mux.HandleFunc("POST /v1/node/config/approval/verify", api.nodeVerifyConfigApproval)
 	mux.HandleFunc("POST /v1/node/config/ack", api.acknowledgeNodeConfig)
 
 	mux.HandleFunc("GET /admin", func(w http.ResponseWriter, r *http.Request) {

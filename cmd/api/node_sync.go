@@ -39,6 +39,7 @@ type nodeConfigDryRunRequest struct {
 type nodeConfigDryRunSummary struct {
 	ConfirmedVersion int64     `json:"confirmed_version"`
 	CandidateVersion int64     `json:"candidate_version"`
+	CandidateDigest  string    `json:"candidate_digest"`
 	Status           string    `json:"status"`
 	AddedCount       int       `json:"added_count"`
 	ChangedCount     int       `json:"changed_count"`
@@ -235,6 +236,11 @@ func (a *API) nodeConfigDryRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
+	digest, err := candidateSnapshotDigest(candidate)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
 	confirmed := in.ConfirmedSnapshot
 	errors := make([]string, 0)
 	if confirmed.NodeID != nodeID {
@@ -253,6 +259,7 @@ func (a *API) nodeConfigDryRun(w http.ResponseWriter, r *http.Request) {
 	summary := nodeConfigDryRunSummary{
 		ConfirmedVersion: confirmed.Version,
 		CandidateVersion: candidate.Version,
+		CandidateDigest:  digest,
 		Status:           status,
 		ValidationErrors: errors,
 	}
@@ -272,8 +279,8 @@ func (a *API) nodeConfigDryRun(w http.ResponseWriter, r *http.Request) {
 	if err := tx.QueryRow(r.Context(),
 		`INSERT INTO node_config_dry_runs
 		 (node_id, confirmed_version, candidate_version, status,
-		  added_count, changed_count, removed_count, network_changed, validation_errors)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		  added_count, changed_count, removed_count, network_changed, validation_errors, candidate_digest)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		 ON CONFLICT (node_id) DO UPDATE SET
 		   confirmed_version = EXCLUDED.confirmed_version,
 		   candidate_version = EXCLUDED.candidate_version,
@@ -283,10 +290,11 @@ func (a *API) nodeConfigDryRun(w http.ResponseWriter, r *http.Request) {
 		   removed_count = EXCLUDED.removed_count,
 		   network_changed = EXCLUDED.network_changed,
 		   validation_errors = EXCLUDED.validation_errors,
+		   candidate_digest = EXCLUDED.candidate_digest,
 		   created_at = NOW()
 		 RETURNING created_at`,
 		nodeID, summary.ConfirmedVersion, summary.CandidateVersion, summary.Status,
-		summary.AddedCount, summary.ChangedCount, summary.RemovedCount, summary.NetworkChanged, summary.ValidationErrors,
+		summary.AddedCount, summary.ChangedCount, summary.RemovedCount, summary.NetworkChanged, summary.ValidationErrors, summary.CandidateDigest,
 	).Scan(&summary.CreatedAt); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
