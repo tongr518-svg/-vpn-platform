@@ -112,7 +112,18 @@ jobs:
           exit "$result"
 
       - name: Test
-        run: flutter test
+        shell: bash
+        run: |
+          set +e
+          output="$(flutter test 2>&1)"
+          result=$?
+          printf '%s\n' "$output"
+          if [ "$result" -ne 0 ]; then
+            while IFS= read -r line; do
+              echo "::error::$line"
+            done <<< "$output"
+          fi
+          exit "$result"
 
   windows-build:
     name: Windows desktop build
