@@ -24,11 +24,7 @@ ClientDemoData buildDemoData(DateTime now) {
   final previousEndsAtText = previousEndsAt.toIso8601String();
 
   return ClientDemoData(
-    user: const {
-      'id': 1001,
-      'email': 'demo@example.test',
-      'status': 'active',
-    },
+    user: const {'id': 1001, 'email': 'demo@example.test', 'status': 'active'},
     subscription: {
       'id': 501,
       'plan_id': 2,

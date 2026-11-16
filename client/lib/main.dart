@@ -21,7 +21,8 @@ Uri parseApiBaseUrl(String raw) {
   }
 
   final host = uri.host.toLowerCase();
-  final isLocalHost = host == 'localhost' ||
+  final isLocalHost =
+      host == 'localhost' ||
       host == '127.0.0.1' ||
       host == '::1' ||
       host == '10.0.2.2';
@@ -467,8 +468,9 @@ class _ClientHomeState extends State<ClientHome> {
       await _loadAccount();
       if (mounted && _token != null) {
         setState(
-          () => _message =
-              cleanupError == null ? '设备已撤销' : '设备已撤销，但本地密钥清理失败：$cleanupError',
+          () => _message = cleanupError == null
+              ? '设备已撤销'
+              : '设备已撤销，但本地密钥清理失败：$cleanupError',
         );
       }
     } catch (error) {
