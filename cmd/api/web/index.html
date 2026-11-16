@@ -91,6 +91,23 @@
     </section>
 
     <section>
+      <div class="row">
+        <h2 style="flex:1">邀请码</h2>
+        <button id="refreshInvites" type="button">刷新</button>
+      </div>
+      <form id="inviteForm" class="row">
+        <label>可用次数 <input id="inviteMaxUses" type="number" min="1" max="100000" value="1" required></label>
+        <label>过期时间（可选） <input id="inviteExpiresAt" type="datetime-local"></label>
+        <button class="primary">创建邀请码</button>
+      </form>
+      <p class="muted">原码只在创建时显示一次，请立即复制保存。列表不会显示原码或哈希。</p>
+      <table>
+        <thead><tr><th>ID</th><th>使用次数</th><th>过期时间</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="invitesBody"></tbody>
+      </table>
+    </section>
+
+    <section>
       <h2>手动开通订阅</h2>
       <form id="subscriptionForm" class="row">
         <input id="subscriptionUserId" type="number" min="1" placeholder="用户 ID" required>
@@ -118,12 +135,12 @@
 
     <section>
       <div class="row">
-        <h2 style="flex:1">管理员操作记录</h2>
+        <h2 style="flex:1">操作审计记录</h2>
         <button id="refreshAuditLogs" type="button">刷新</button>
       </div>
       <table>
         <thead>
-          <tr><th>时间</th><th>管理员</th><th>操作</th><th>目标类型</th><th>目标 ID</th></tr>
+          <tr><th>时间</th><th>操作者</th><th>操作</th><th>目标类型</th><th>目标 ID</th></tr>
         </thead>
         <tbody id="auditLogsBody"></tbody>
       </table>
@@ -303,6 +320,44 @@
     }
   }
 
+  async function loadInvites() {
+    const invites = await api("/v1/admin/invites");
+    const body = $("invitesBody");
+    body.replaceChildren();
+    for (const invite of invites) {
+      const tr = document.createElement("tr");
+      cell(tr, invite.id);
+      cell(tr, `${invite.uses} / ${invite.max_uses}`);
+      cell(tr, dateText(invite.expires_at) || "永不过期");
+      const statusText = {
+        active: "有效",
+        exhausted: "已用完",
+        expired: "已过期",
+        revoked: "已撤销"
+      }[invite.status] || invite.status;
+      cell(tr, statusText);
+      const td = document.createElement("td");
+      if (invite.status !== "revoked") {
+        const button = document.createElement("button");
+        button.textContent = "撤销";
+        button.className = "danger";
+        button.addEventListener("click", async () => {
+          if (!confirm(`确定撤销邀请码 #${invite.id} 吗？`)) return;
+          button.disabled = true;
+          try {
+            await api(`/v1/admin/invites/${invite.id}`, { method: "DELETE" });
+            message(`邀请码 #${invite.id} 已撤销`);
+            await loadInvites();
+          } catch (error) { handleAuthError(error); }
+          finally { button.disabled = false; }
+        });
+        td.appendChild(button);
+      }
+      tr.appendChild(td);
+      body.appendChild(tr);
+    }
+  }
+
   async function loadSubscriptions() {
     const subscriptions = await api("/v1/admin/subscriptions");
     const body = $("subscriptionsBody");
@@ -356,7 +411,7 @@
 
   async function refresh() {
     try {
-      await Promise.all([loadUsers(), loadPlans(), loadSubscriptions(), loadAuditLogs()]);
+      await Promise.all([loadUsers(), loadPlans(), loadInvites(), loadSubscriptions(), loadAuditLogs()]);
       message("数据已刷新");
     } catch (error) { handleAuthError(error); }
   }
@@ -395,6 +450,7 @@
   });
   $("refreshUsers").addEventListener("click", () => loadUsers().catch(handleAuthError));
   $("refreshPlans").addEventListener("click", () => loadPlans().catch(handleAuthError));
+  $("refreshInvites").addEventListener("click", () => loadInvites().catch(handleAuthError));
   $("refreshSubscriptions").addEventListener(
     "click",
     () => loadSubscriptions().catch(handleAuthError)
@@ -420,6 +476,24 @@
       $("planForm").reset();
       message("套餐已创建");
       await loadPlans();
+    } catch (error) { handleAuthError(error); }
+  });
+
+  $("inviteForm").addEventListener("submit", async event => {
+    event.preventDefault();
+    const expiryValue = $("inviteExpiresAt").value;
+    try {
+      const result = await api("/v1/admin/invites", {
+        method: "POST",
+        body: {
+          max_uses: Number($("inviteMaxUses").value),
+          ...(expiryValue ? { expires_at: new Date(expiryValue).toISOString() } : {})
+        }
+      });
+      $("inviteForm").reset();
+      window.prompt("邀请码原码只显示这一次，请立即复制并安全保存：", result.code);
+      message("邀请码已创建；原码不会再次显示，请确认已复制保存");
+      await loadInvites();
     } catch (error) { handleAuthError(error); }
   });
 

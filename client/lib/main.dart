@@ -6,6 +6,31 @@ import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
+Uri parseApiBaseUrl(String raw) {
+  final uri = Uri.tryParse(raw.trim());
+  if (uri == null ||
+      !uri.hasAuthority ||
+      uri.host.isEmpty ||
+      uri.userInfo.isNotEmpty ||
+      uri.hasQuery ||
+      uri.hasFragment ||
+      (uri.path.isNotEmpty && uri.path != '/')) {
+    throw const FormatException('API 地址格式无效');
+  }
+
+  final host = uri.host.toLowerCase();
+  final isLocalHost = host == 'localhost' ||
+      host == '127.0.0.1' ||
+      host == '::1' ||
+      host == '10.0.2.2';
+
+  if (uri.scheme != 'https' && !(uri.scheme == 'http' && isLocalHost)) {
+    throw const FormatException('远程 API 必须使用 HTTPS');
+  }
+
+  return uri;
+}
+
 void main() {
   runApp(const VpnClientApp());
 }
@@ -35,6 +60,7 @@ class ClientHome extends StatefulWidget {
 
 class _ClientHomeState extends State<ClientHome> {
   static const _secureStorage = FlutterSecureStorage();
+  static const _apiBaseUrlStorageKey = 'api_base_url_v1';
   static const _tokenStorageKey = 'api_access_token_v1';
 
   final _baseUrlController = TextEditingController(
@@ -47,9 +73,11 @@ class _ClientHomeState extends State<ClientHome> {
   String? _token;
   Map<String, dynamic>? _user;
   Map<String, dynamic>? _subscription;
+  List<dynamic> _subscriptionHistory = [];
   List<dynamic> _devices = [];
   String? _message;
   String? _subscriptionMessage;
+  String? _subscriptionHistoryMessage;
   String? _devicesMessage;
   bool _busy = false;
   bool _isRegistering = false;
@@ -63,8 +91,45 @@ class _ClientHomeState extends State<ClientHome> {
 
   Future<void> _restoreSession() async {
     try {
+      final savedBaseUrl = await _secureStorage.read(
+        key: _apiBaseUrlStorageKey,
+      );
+      if (savedBaseUrl != null && savedBaseUrl.isNotEmpty) {
+        try {
+          parseApiBaseUrl(savedBaseUrl);
+        } on FormatException {
+          try {
+            await _secureStorage.delete(key: _tokenStorageKey);
+          } catch (_) {}
+          try {
+            await _secureStorage.delete(key: _apiBaseUrlStorageKey);
+          } catch (_) {}
+
+          if (mounted) {
+            setState(() {
+              _token = null;
+              _message = '保存的 API 地址无效，请重新登录并检查地址';
+            });
+          }
+          return;
+        }
+        _baseUrlController.text = savedBaseUrl;
+      }
+
       final savedToken = await _secureStorage.read(key: _tokenStorageKey);
       if (savedToken != null && savedToken.isNotEmpty) {
+        if (savedBaseUrl == null || savedBaseUrl.isEmpty) {
+          try {
+            await _secureStorage.delete(key: _tokenStorageKey);
+          } catch (_) {}
+          if (mounted) {
+            setState(() {
+              _token = null;
+              _message = '尚未保存 API 地址，请确认地址后重新登录';
+            });
+          }
+          return;
+        }
         if (!mounted) return;
         setState(() => _token = savedToken);
         await _loadAccount();
@@ -79,6 +144,13 @@ class _ClientHomeState extends State<ClientHome> {
   }
 
   Future<void> _saveSessionToken(String token) async {
+    final uri = parseApiBaseUrl(_baseUrlController.text);
+    final normalizedBaseUrl = uri.toString().replaceFirst(RegExp(r'/+$'), '');
+
+    await _secureStorage.write(
+      key: _apiBaseUrlStorageKey,
+      value: normalizedBaseUrl,
+    );
     await _secureStorage.write(key: _tokenStorageKey, value: token);
     if (mounted) setState(() => _token = token);
   }
@@ -108,7 +180,8 @@ class _ClientHomeState extends State<ClientHome> {
     String method = 'GET',
     Map<String, dynamic>? body,
   }) async {
-    final uri = Uri.parse('$_baseUrl$path');
+    final baseUri = parseApiBaseUrl(_baseUrl);
+    final uri = baseUri.resolve(path);
     final headers = <String, String>{
       'Accept': 'application/json',
       if (body != null) 'Content-Type': 'application/json',
@@ -262,6 +335,19 @@ class _ClientHomeState extends State<ClientHome> {
         }
       }
 
+      List<dynamic> subscriptionHistory = [];
+      String? subscriptionHistoryMessage;
+      try {
+        final historyResult = await _request('/v1/me/subscriptions');
+        if (historyResult is List) {
+          subscriptionHistory = historyResult;
+        } else if (historyResult is Map && historyResult['data'] is List) {
+          subscriptionHistory = historyResult['data'] as List<dynamic>;
+        }
+      } catch (error) {
+        subscriptionHistoryMessage = _errorText(error);
+      }
+
       List<dynamic> devices = [];
       String? devicesMessage;
       try {
@@ -286,8 +372,10 @@ class _ClientHomeState extends State<ClientHome> {
       setState(() {
         _user = me;
         _subscription = subscription;
+        _subscriptionHistory = subscriptionHistory;
         _devices = devices;
         _subscriptionMessage = subscriptionMessage;
+        _subscriptionHistoryMessage = subscriptionHistoryMessage;
         _devicesMessage = devicesMessage;
         _message = null;
       });
@@ -658,6 +746,41 @@ class _ClientHomeState extends State<ClientHome> {
     }
   }
 
+  Future<void> _revokeAllSessions() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('退出所有设备'),
+        content: const Text('所有设备上的登录状态都会失效，需要重新登录。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('确认退出'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() {
+      _busy = true;
+      _message = null;
+    });
+    try {
+      await _request('/v1/me/sessions/revoke', method: 'POST');
+      await _logout();
+      if (mounted) setState(() => _message = '所有会话已撤销，请重新登录');
+    } catch (error) {
+      if (mounted) setState(() => _message = _errorText(error));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   String _errorText(Object error) =>
       error.toString().replaceFirst('Exception: ', '');
 
@@ -672,8 +795,10 @@ class _ClientHomeState extends State<ClientHome> {
       _token = null;
       _user = null;
       _subscription = null;
+      _subscriptionHistory = [];
       _devices = [];
       _subscriptionMessage = null;
+      _subscriptionHistoryMessage = null;
       _devicesMessage = null;
       _message = message;
       _passwordController.clear();
@@ -840,10 +965,24 @@ class _ClientHomeState extends State<ClientHome> {
             label: const Text('修改密码'),
           ),
         ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: OutlinedButton.icon(
+            onPressed: _busy ? null : _revokeAllSessions,
+            icon: const Icon(Icons.devices_other),
+            label: const Text('退出所有设备'),
+          ),
+        ),
         Card(
           child: Padding(
             padding: const EdgeInsets.all(16),
             child: _subscriptionCard(),
+          ),
+        ),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: _subscriptionHistoryCard(),
           ),
         ),
         Card(
@@ -902,6 +1041,61 @@ class _ClientHomeState extends State<ClientHome> {
         Text('流量上限：${subscription['data_limit_bytes'] ?? 0} 字节（0 表示不限）'),
         Text('速度上限：${subscription['speed_limit_mbps'] ?? 0} Mbps（0 表示不限）'),
         Text('到期时间：${subscription['ends_at'] ?? '—'}'),
+      ],
+    );
+  }
+
+  Widget _subscriptionHistoryCard() {
+    String displayDate(dynamic value) {
+      if (value is! String) return '—';
+      final parsed = DateTime.tryParse(value);
+      if (parsed == null) return value;
+      return parsed.toLocal().toString().split('.').first;
+    }
+
+    String displayStatus(dynamic value) {
+      switch (value) {
+        case 'active':
+          return '生效中';
+        case 'scheduled':
+          return '待生效';
+        case 'expired':
+          return '已过期';
+        case 'cancelled':
+          return '已取消';
+        default:
+          return value?.toString() ?? '未知';
+      }
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('订阅历史', style: Theme.of(context).textTheme.titleLarge),
+        const SizedBox(height: 8),
+        if (_subscriptionHistoryMessage != null)
+          Text('订阅历史暂不可用：$_subscriptionHistoryMessage')
+        else if (_subscriptionHistory.isEmpty)
+          const Text('暂无订阅记录')
+        else
+          ..._subscriptionHistory.map((item) {
+            if (item is! Map) return const SizedBox.shrink();
+            return ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: Text(item['plan_name']?.toString() ?? '套餐'),
+              subtitle: Text(
+                '${displayStatus(item['status'])}\n'
+                '${displayDate(item['starts_at'])} — '
+                '${displayDate(item['ends_at'])}',
+              ),
+              isThreeLine: true,
+            );
+          }),
+        const SizedBox(height: 4),
+        const Text(
+          '最多显示最近 100 条记录。',
+          style: TextStyle(color: Colors.grey),
+        ),
       ],
     );
   }

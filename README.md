@@ -67,13 +67,18 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8080/v1/auth/register -Cont
 Remove-Variable inviteCode, registerBody
 ```
 
-不要使用示例密码。注册后，在数据库中手动提升管理员角色；项目没有公开的管理员升级接口：
+不要使用示例密码。注册管理员账号后，先确认 API 至少启动过一次并完成数据库迁移，然后在本机运行一次性初始化命令。它只在数据库还没有任何管理员时提升指定的 active 用户；角色变更、令牌版本递增和审计记录在同一事务中完成。已有管理员时命令会拒绝操作。
 
 ```powershell
-docker compose exec db psql -U vpn -d vpn -c "UPDATE users SET role = 'admin' WHERE email = 'admin@example.test';"
+cd D:\vpn-platform
+$env:DATABASE_URL = "postgres://vpn:URL编码后的数据库密码@localhost:5432/vpn?sslmode=disable"
+go run .\cmd\admin-bootstrap -email "admin@example.test"
+Remove-Item Env:DATABASE_URL
 ```
 
-打开管理后台并用该账号登录。管理员可创建套餐、给有效用户开通订阅、查看并取消订阅、管理用户状态和设备，并在“管理员操作记录”中查看已记录的后台操作。审计日志不会补齐该功能启用前的历史操作。普通客户端使用登录返回的 JWT 查看账号、订阅与自己的设备。
+这是本机运维命令，不会新增公开提权接口。不要把 `DATABASE_URL` 或数据库密码写入仓库、提交到 Git，或贴到日志中；密码含 URL 特殊字符时必须先编码。后续管理员在后台管理。打开管理后台并用该账号登录，可创建套餐、给有效用户开通订阅、查看并取消订阅、管理用户状态和设备，并在“操作审计记录”中查看已记录的管理员操作、用户改密和设备操作。设备审计只记录操作者、动作和设备 ID，不记录密钥。审计日志不会补齐该功能启用前的历史操作。普通客户端使用登录返回的 JWT 查看账号、订阅与自己的设备。
+
+管理员也可在后台创建限次数、可选过期的邀请码。原码只在创建响应中显示一次，数据库仅存 SHA-256 哈希；请立即复制保存。旧 `INVITE_CODE` 仅在数据库尚无管理员时作为升级兼容口令，首位管理员创建正式邀请码后即不再有效。
 
 ## 手动验证清单
 
@@ -86,7 +91,7 @@ docker compose exec db psql -U vpn -d vpn -c "UPDATE users SET role = 'admin' WH
 5. 有有效订阅时注册一台设备应成功；再注册第二台应返回 `device_limit_reached`。撤销第一台后，设备列表会保留撤销状态，套餐名额可以重新使用。
 6. 取消订阅后，`/v1/me/subscription` 不再返回有效订阅，设备注册应返回 `active_subscription_required`。
 
-注册和登录接口分别为 `POST /v1/auth/register`、`POST /v1/auth/login`。受保护接口使用 `Authorization: Bearer <token>`。更多管理员路由见 `cmd/api/main.go`，业务处理位于 `cmd/api/admin*.go`。
+注册和登录接口分别为 `POST /v1/auth/register`、`POST /v1/auth/login`。受保护接口使用 `Authorization: Bearer <token>`。完整路由、权限、请求字段和常见错误码见 [`docs/API.md`](docs/API.md)；业务处理位于 `cmd/api/`。
 
 ## 集成测试
 

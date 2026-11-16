@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +25,9 @@ func testFixture(t *testing.T) (*API, int64, func()) {
 
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
+		if os.Getenv("REQUIRE_INTEGRATION_TESTS") == "1" {
+			t.Fatal("CI 要求运行集成测试，但 TEST_DATABASE_URL 未设置")
+		}
 		t.Skip("设置 TEST_DATABASE_URL 后运行 PostgreSQL 集成测试")
 	}
 
@@ -100,13 +106,7 @@ func testFixture(t *testing.T) (*API, int64, func()) {
 }
 
 func testRouter(api *API) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/devices", api.listDevices)
-	mux.HandleFunc("POST /v1/devices", api.createDevice)
-	mux.HandleFunc("PATCH /v1/devices/{id}", api.renameMyDevice)
-	mux.HandleFunc("DELETE /v1/devices/{id}", api.revokeDevice)
-	mux.HandleFunc("POST /v1/me/password", api.changeMyPassword)
-	return mux
+	return newRouter(api)
 }
 
 func testToken(t *testing.T, api *API, userID int64) string {
@@ -146,6 +146,48 @@ func testRequest(
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 	return recorder
+}
+
+func testAdminToken(t *testing.T, api *API, userID int64) string {
+	t.Helper()
+	if _, err := api.db.Exec(context.Background(),
+		`UPDATE users SET role = 'admin' WHERE id = $1`, userID,
+	); err != nil {
+		t.Fatalf("设置测试管理员失败: %v", err)
+	}
+	return testToken(t, api, userID)
+}
+
+func createTestInvite(t *testing.T, handler http.Handler, token string, maxUses int) (int64, string) {
+	t.Helper()
+	response := testRequest(t, handler, http.MethodPost, "/v1/admin/invites", token,
+		map[string]any{"max_uses": maxUses})
+	if response.Code != http.StatusCreated {
+		t.Fatalf("创建测试邀请码失败，得到 %d：%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		Code   string `json:"code"`
+		Invite struct {
+			ID int64 `json:"id"`
+		} `json:"invite"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatalf("解析邀请码创建响应失败: %v", err)
+	}
+	if result.Code == "" || result.Invite.ID <= 0 {
+		t.Fatalf("邀请码创建响应缺少原码或 ID：%s", response.Body.String())
+	}
+	return result.Invite.ID, result.Code
+}
+
+func registerWithInvite(t *testing.T, handler http.Handler, email, inviteCode string) *httptest.ResponseRecorder {
+	t.Helper()
+	return testRequest(t, handler, http.MethodPost, "/v1/auth/register", "",
+		map[string]any{
+			"email":       email,
+			"password":    "test-password-123",
+			"invite_code": inviteCode,
+		})
 }
 
 func addActiveTestPlan(t *testing.T, api *API, userID int64, deviceLimit int) {
@@ -197,6 +239,142 @@ func TestDeviceRegistrationRequiresActiveSubscription(t *testing.T) {
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("期望状态码 %d，得到 %d：%s",
 			http.StatusForbidden, response.Code, response.Body.String())
+	}
+}
+
+func TestExistingSubscriptionWorksAfterPlanIsDeactivated(t *testing.T) {
+	api, userID, cleanup := testFixture(t)
+	defer cleanup()
+
+	addActiveTestPlan(t, api, userID, 1)
+
+	ctx := context.Background()
+	var planID int64
+	if err := api.db.QueryRow(ctx,
+		`SELECT plan_id FROM subscriptions WHERE user_id = $1 ORDER BY id DESC LIMIT 1`,
+		userID,
+	).Scan(&planID); err != nil {
+		t.Fatalf("查询测试套餐失败: %v", err)
+	}
+
+	if _, err := api.db.Exec(ctx,
+		`UPDATE plans SET active = FALSE WHERE id = $1`,
+		planID,
+	); err != nil {
+		t.Fatalf("停用测试套餐失败: %v", err)
+	}
+
+	response := testRequest(
+		t,
+		testRouter(api),
+		http.MethodPost,
+		"/v1/devices",
+		testToken(t, api, userID),
+		map[string]any{
+			"name":       "existing-subscriber-device",
+			"platform":   "windows",
+			"public_key": testPublicKey(9),
+		},
+	)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("已有有效订阅的用户仍应可注册设备，得到 %d：%s",
+			response.Code, response.Body.String())
+	}
+}
+
+func TestListMySubscriptionsShowsHistoryAndOnlyOwnRecords(t *testing.T) {
+	api, userID, cleanup := testFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	var planID int64
+	if err := api.db.QueryRow(ctx,
+		`INSERT INTO plans (name, device_limit, concurrent_limit)
+		 VALUES ('history-plan', 2, 1)
+		 RETURNING id`,
+	).Scan(&planID); err != nil {
+		t.Fatalf("创建测试套餐失败: %v", err)
+	}
+
+	_, err := api.db.Exec(ctx,
+		`INSERT INTO subscriptions (user_id, plan_id, status, starts_at, ends_at)
+		 VALUES ($1, $2, 'active', NOW() - INTERVAL '2 days', NOW() - INTERVAL '1 day'),
+		        ($1, $2, 'cancelled', NOW() - INTERVAL '1 hour', NOW() + INTERVAL '1 day')`,
+		userID, planID,
+	)
+	if err != nil {
+		t.Fatalf("创建测试用户订阅历史失败: %v", err)
+	}
+	var explicitlyExpiredID int64
+	if err := api.db.QueryRow(ctx,
+		`INSERT INTO subscriptions (user_id, plan_id, status, starts_at, ends_at)
+		 VALUES ($1, $2, 'expired', NOW() - INTERVAL '1 day', NOW() + INTERVAL '1 day')
+		 RETURNING id`,
+		userID, planID,
+	).Scan(&explicitlyExpiredID); err != nil {
+		t.Fatalf("创建状态与日期不一致的订阅失败: %v", err)
+	}
+
+	var otherUserID int64
+	if err := api.db.QueryRow(ctx,
+		`INSERT INTO users (email, password_hash, role, status)
+		 VALUES ('history-other@example.test', 'test-hash', 'user', 'active')
+		 RETURNING id`,
+	).Scan(&otherUserID); err != nil {
+		t.Fatalf("创建另一测试用户失败: %v", err)
+	}
+	if _, err := api.db.Exec(ctx,
+		`INSERT INTO subscriptions (user_id, plan_id, status, starts_at, ends_at)
+		 VALUES ($1, $2, 'active', NOW() - INTERVAL '1 minute', NOW() + INTERVAL '1 day')`,
+		otherUserID, planID,
+	); err != nil {
+		t.Fatalf("创建另一用户订阅失败: %v", err)
+	}
+
+	response := testRequest(t, testRouter(api), http.MethodGet,
+		"/v1/me/subscriptions", testToken(t, api, userID), nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("订阅历史查询应返回 200，得到 %d：%s", response.Code, response.Body.String())
+	}
+	var subscriptions []userSubscriptionRecord
+	if err := json.Unmarshal(response.Body.Bytes(), &subscriptions); err != nil {
+		t.Fatalf("解析订阅历史失败: %v", err)
+	}
+	if len(subscriptions) != 3 {
+		t.Fatalf("只应返回当前用户的 3 条订阅，实际为 %d：%s", len(subscriptions), response.Body.String())
+	}
+	statuses := make(map[string]bool, len(subscriptions))
+	statusByID := make(map[int64]string, len(subscriptions))
+	for _, subscription := range subscriptions {
+		if subscription.PlanName != "history-plan" {
+			t.Errorf("套餐名称不匹配：%q", subscription.PlanName)
+		}
+		statuses[subscription.Status] = true
+		statusByID[subscription.ID] = subscription.Status
+	}
+	if !statuses["expired"] || !statuses["cancelled"] {
+		t.Fatalf("应返回 expired 和 cancelled 展示状态，实际为 %#v", statuses)
+	}
+	if statusByID[explicitlyExpiredID] != "expired" {
+		t.Fatalf("数据库状态为 expired 的记录应继续显示 expired，即使结束时间在未来；实际状态为 %q", statusByID[explicitlyExpiredID])
+	}
+}
+
+func TestListMySubscriptionsReturnsEmptyArrayWithoutHistory(t *testing.T) {
+	api, userID, cleanup := testFixture(t)
+	defer cleanup()
+
+	response := testRequest(t, testRouter(api), http.MethodGet,
+		"/v1/me/subscriptions", testToken(t, api, userID), nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("无订阅历史时应返回 200，得到 %d：%s", response.Code, response.Body.String())
+	}
+	var subscriptions []userSubscriptionRecord
+	if err := json.Unmarshal(response.Body.Bytes(), &subscriptions); err != nil {
+		t.Fatalf("解析空订阅历史失败: %v", err)
+	}
+	if subscriptions == nil || len(subscriptions) != 0 {
+		t.Fatalf("无订阅历史时应返回空数组，得到 %s", response.Body.String())
 	}
 }
 
@@ -308,6 +486,12 @@ func TestUserCannotRevokeAnotherUsersDevice(t *testing.T) {
 	).Scan(&otherUserID); err != nil {
 		t.Fatalf("创建第二个测试用户失败: %v", err)
 	}
+	var auditCountBefore int
+	if err := api.db.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM admin_audit_logs`,
+	).Scan(&auditCountBefore); err != nil {
+		t.Fatalf("查询撤销前审计记录数量失败: %v", err)
+	}
 
 	response := testRequest(
 		t,
@@ -320,6 +504,15 @@ func TestUserCannotRevokeAnotherUsersDevice(t *testing.T) {
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("跨用户撤销应返回 %d，得到 %d：%s",
 			http.StatusNotFound, response.Code, response.Body.String())
+	}
+	var auditCountAfter int
+	if err := api.db.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM admin_audit_logs`,
+	).Scan(&auditCountAfter); err != nil {
+		t.Fatalf("查询撤销后审计记录数量失败: %v", err)
+	}
+	if auditCountAfter != auditCountBefore {
+		t.Fatalf("跨用户撤销不应新增审计记录：之前 %d 条，现在 %d 条", auditCountBefore, auditCountAfter)
 	}
 }
 
@@ -386,6 +579,90 @@ func TestUserCanRenameOwnDeviceButNotAnotherUsersDevice(t *testing.T) {
 	}
 }
 
+func TestDeviceLifecycleWritesAuditAndRejectedCrossUserActionDoesNot(t *testing.T) {
+	api, userID, cleanup := testFixture(t)
+	defer cleanup()
+	addActiveTestPlan(t, api, userID, 1)
+
+	ctx := context.Background()
+	handler := testRouter(api)
+	token := testToken(t, api, userID)
+
+	created := testRequest(t, handler, http.MethodPost, "/v1/devices", token,
+		map[string]any{
+			"name":       "audit-device",
+			"platform":   "windows",
+			"public_key": testPublicKey(31),
+		},
+	)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("设备注册失败，得到 %d：%s", created.Code, created.Body.String())
+	}
+	var createdDevice map[string]any
+	if err := json.Unmarshal(created.Body.Bytes(), &createdDevice); err != nil {
+		t.Fatalf("解析注册响应失败: %v", err)
+	}
+	deviceID, ok := createdDevice["id"].(float64)
+	if !ok {
+		t.Fatalf("注册响应中缺少设备 ID：%s", created.Body.String())
+	}
+	assertDeviceAudit := func(action string) {
+		t.Helper()
+		var count int
+		if err := api.db.QueryRow(ctx,
+			`SELECT COUNT(*) FROM admin_audit_logs
+			 WHERE actor_user_id = $1 AND action = $2
+			   AND target_type = 'device' AND target_id = $3`,
+			userID, action, fmt.Sprint(int64(deviceID)),
+		).Scan(&count); err != nil {
+			t.Fatalf("查询 %s 审计记录失败: %v", action, err)
+		}
+		if count != 1 {
+			t.Fatalf("%s 应有 1 条设备审计记录，实际为 %d", action, count)
+		}
+	}
+	assertDeviceAudit("register_device")
+
+	renamePath := fmt.Sprintf("/v1/devices/%d", int64(deviceID))
+	renamed := testRequest(t, handler, http.MethodPatch, renamePath, token,
+		map[string]any{"name": "renamed-audit-device"})
+	if renamed.Code != http.StatusOK {
+		t.Fatalf("设备重命名失败，得到 %d：%s", renamed.Code, renamed.Body.String())
+	}
+	assertDeviceAudit("rename_device")
+
+	var otherUserID int64
+	if err := api.db.QueryRow(ctx,
+		`INSERT INTO users (email, password_hash, role, status)
+		 VALUES ('audit-other@example.test', 'test-hash', 'user', 'active')
+		 RETURNING id`,
+	).Scan(&otherUserID); err != nil {
+		t.Fatalf("创建第二个测试用户失败: %v", err)
+	}
+	var auditCountBefore int
+	if err := api.db.QueryRow(ctx, `SELECT COUNT(*) FROM admin_audit_logs`).Scan(&auditCountBefore); err != nil {
+		t.Fatalf("查询审计记录数量失败: %v", err)
+	}
+	denied := testRequest(t, handler, http.MethodPatch, renamePath,
+		testToken(t, api, otherUserID), map[string]any{"name": "forbidden-name"})
+	if denied.Code != http.StatusNotFound {
+		t.Fatalf("跨用户重命名应返回 404，得到 %d：%s", denied.Code, denied.Body.String())
+	}
+	var auditCountAfter int
+	if err := api.db.QueryRow(ctx, `SELECT COUNT(*) FROM admin_audit_logs`).Scan(&auditCountAfter); err != nil {
+		t.Fatalf("再次查询审计记录数量失败: %v", err)
+	}
+	if auditCountAfter != auditCountBefore {
+		t.Fatalf("跨用户操作不应新增审计记录：之前 %d 条，现在 %d 条", auditCountBefore, auditCountAfter)
+	}
+
+	revoked := testRequest(t, handler, http.MethodDelete, renamePath, token, nil)
+	if revoked.Code != http.StatusNoContent {
+		t.Fatalf("设备撤销失败，得到 %d：%s", revoked.Code, revoked.Body.String())
+	}
+	assertDeviceAudit("revoke_device")
+}
+
 func TestSuspendedUserCannotLogin(t *testing.T) {
 	api, userID, cleanup := testFixture(t)
 	defer cleanup()
@@ -423,6 +700,38 @@ func TestSuspendedUserCannotLogin(t *testing.T) {
 	}
 }
 
+func TestRevokeMySessionsInvalidatesCurrentJWTAndAudits(t *testing.T) {
+	api, userID, cleanup := testFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	token := testToken(t, api, userID)
+	handler := testRouter(api)
+
+	revoked := testRequest(t, handler, http.MethodPost,
+		"/v1/me/sessions/revoke", token, nil)
+	if revoked.Code != http.StatusNoContent {
+		t.Fatalf("撤销会话应返回 204，得到 %d：%s", revoked.Code, revoked.Body.String())
+	}
+
+	protected := testRequest(t, handler, http.MethodGet, "/v1/me", token, nil)
+	if protected.Code != http.StatusUnauthorized {
+		t.Fatalf("撤销后原 JWT 应返回 401，得到 %d：%s", protected.Code, protected.Body.String())
+	}
+
+	var auditCount int
+	if err := api.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM admin_audit_logs
+		 WHERE actor_user_id = $1 AND action = 'revoke_sessions'
+		   AND target_type = 'user' AND target_id = $2`,
+		userID, fmt.Sprint(userID),
+	).Scan(&auditCount); err != nil {
+		t.Fatalf("查询会话撤销审计记录失败: %v", err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("撤销会话后应有 1 条审计记录，实际为 %d", auditCount)
+	}
+}
+
 func TestSuspendedUserCannotUseExistingJWT(t *testing.T) {
 	api, userID, cleanup := testFixture(t)
 	defer cleanup()
@@ -445,7 +754,7 @@ func TestSuspendedUserCannotUseExistingJWT(t *testing.T) {
 		nil,
 	)
 	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("暂停账号的既有 JWT 应被拒绝，得到 %d：%s",
+		t.Fatalf("暂停账号的既有 JWT 应被拒绝，期望 %d，得到 %d：%s",
 			http.StatusUnauthorized, response.Code, response.Body.String())
 	}
 
@@ -466,7 +775,7 @@ func TestSuspendedUserCannotUseExistingJWT(t *testing.T) {
 		nil,
 	)
 	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("恢复账号后旧 JWT 仍应失效，得到 %d：%s",
+		t.Fatalf("恢复账号后旧 JWT 仍应失效，期望 %d，得到 %d：%s",
 			http.StatusUnauthorized, response.Code, response.Body.String())
 	}
 }
@@ -610,14 +919,14 @@ func TestAdminAPIRequiresAdminRole(t *testing.T) {
 
 	response := testRequest(t, handler, http.MethodGet, "/v1/admin/users", "", nil)
 	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("未登录访问管理员接口应返回 401，得到 %d：%s",
-			http.StatusUnauthorized, response.Code, response.Body.String())
+		t.Fatalf("未登录访问管理员接口应返回 401，实际得到 %d：%s",
+			response.Code, response.Body.String())
 	}
 
 	response = testRequest(t, handler, http.MethodGet, "/v1/admin/users", token, nil)
 	if response.Code != http.StatusForbidden {
-		t.Fatalf("普通用户访问管理员接口应返回 403，得到 %d：%s",
-			http.StatusForbidden, response.Code, response.Body.String())
+		t.Fatalf("普通用户访问管理员接口应返回 403，实际得到 %d：%s",
+			response.Code, response.Body.String())
 	}
 
 	if _, err := api.db.Exec(context.Background(),
@@ -628,16 +937,16 @@ func TestAdminAPIRequiresAdminRole(t *testing.T) {
 
 	response = testRequest(t, handler, http.MethodPost, "/v1/admin/plans", token,
 		map[string]any{
-			"name":              "integration-plan",
-			"device_limit":      2,
-			"concurrent_limit":  1,
-			"data_limit_bytes":  0,
-			"speed_limit_mbps":  0,
+			"name":             "integration-plan",
+			"device_limit":     2,
+			"concurrent_limit": 1,
+			"data_limit_bytes": 0,
+			"speed_limit_mbps": 0,
 		},
 	)
 	if response.Code != http.StatusCreated {
-		t.Fatalf("管理员创建套餐应返回 201，得到 %d：%s",
-			http.StatusCreated, response.Code, response.Body.String())
+		t.Fatalf("管理员创建套餐应返回 201，实际得到 %d：%s",
+			response.Code, response.Body.String())
 	}
 
 	var auditCount int
@@ -715,4 +1024,210 @@ func TestAdminCannotCancelExpiredSubscription(t *testing.T) {
 	if status != "active" {
 		t.Fatalf("过期订阅状态不应被取消接口修改，实际为 %q", status)
 	}
+}
+
+func TestInviteRegistrationConsumesUseAndStoresOnlyHash(t *testing.T) {
+	api, adminID, cleanup := testFixture(t)
+	defer cleanup()
+	adminToken := testAdminToken(t, api, adminID)
+	handler := testRouter(api)
+
+	inviteID, code := createTestInvite(t, handler, adminToken, 1)
+	var storedHash []byte
+	if err := api.db.QueryRow(context.Background(),
+		`SELECT code_hash FROM invite_codes WHERE id = $1`, inviteID,
+	).Scan(&storedHash); err != nil {
+		t.Fatalf("读取邀请码哈希失败: %v", err)
+	}
+	expectedHash := sha256.Sum256([]byte(code))
+	if !bytes.Equal(storedHash, expectedHash[:]) {
+		t.Fatal("数据库中存储的邀请码不是原码的 SHA-256 哈希")
+	}
+
+	listResponse := testRequest(t, handler, http.MethodGet, "/v1/admin/invites", adminToken, nil)
+	if listResponse.Code != http.StatusOK {
+		t.Fatalf("查询邀请码应返回 200，得到 %d：%s", listResponse.Code, listResponse.Body.String())
+	}
+	if strings.Contains(listResponse.Body.String(), code) || strings.Contains(listResponse.Body.String(), "code_hash") {
+		t.Fatalf("邀请码列表不应包含原码或哈希字段：%s", listResponse.Body.String())
+	}
+
+	registered := registerWithInvite(t, handler, "invite-success@example.test", code)
+	if registered.Code != http.StatusCreated {
+		t.Fatalf("有效邀请码注册应成功，得到 %d：%s", registered.Code, registered.Body.String())
+	}
+	var uses int
+	if err := api.db.QueryRow(context.Background(),
+		`SELECT uses FROM invite_codes WHERE id = $1`, inviteID,
+	).Scan(&uses); err != nil {
+		t.Fatalf("读取邀请码使用次数失败: %v", err)
+	}
+	if uses != 1 {
+		t.Fatalf("邀请码使用次数应为 1，实际为 %d", uses)
+	}
+
+	reused := registerWithInvite(t, handler, "invite-reuse@example.test", code)
+	if reused.Code != http.StatusForbidden {
+		t.Fatalf("达到次数上限的邀请码应返回 403，得到 %d：%s", reused.Code, reused.Body.String())
+	}
+
+	auditResponse := testRequest(t, handler, http.MethodGet, "/v1/admin/audit-logs", adminToken, nil)
+	if auditResponse.Code != http.StatusOK {
+		t.Fatalf("查询审计记录应返回 200，得到 %d：%s", auditResponse.Code, auditResponse.Body.String())
+	}
+	if strings.Contains(auditResponse.Body.String(), code) {
+		t.Fatal("审计记录中不应包含邀请码原码")
+	}
+}
+
+func TestExpiredAndRevokedInviteCodesCannotRegister(t *testing.T) {
+	api, adminID, cleanup := testFixture(t)
+	defer cleanup()
+	adminToken := testAdminToken(t, api, adminID)
+	handler := testRouter(api)
+
+	expiredID, expiredCode := createTestInvite(t, handler, adminToken, 2)
+	if _, err := api.db.Exec(context.Background(),
+		`UPDATE invite_codes SET expires_at = NOW() - INTERVAL '1 minute' WHERE id = $1`,
+		expiredID,
+	); err != nil {
+		t.Fatalf("设置邀请码过期失败: %v", err)
+	}
+	expired := registerWithInvite(t, handler, "expired-invite@example.test", expiredCode)
+	if expired.Code != http.StatusForbidden {
+		t.Fatalf("过期邀请码应返回 403，得到 %d：%s", expired.Code, expired.Body.String())
+	}
+
+	revokedID, revokedCode := createTestInvite(t, handler, adminToken, 2)
+	revoked := testRequest(t, handler, http.MethodDelete,
+		fmt.Sprintf("/v1/admin/invites/%d", revokedID), adminToken, nil)
+	if revoked.Code != http.StatusNoContent {
+		t.Fatalf("撤销邀请码应返回 204，得到 %d：%s", revoked.Code, revoked.Body.String())
+	}
+	registration := registerWithInvite(t, handler, "revoked-invite@example.test", revokedCode)
+	if registration.Code != http.StatusForbidden {
+		t.Fatalf("已撤销邀请码应返回 403，得到 %d：%s", registration.Code, registration.Body.String())
+	}
+}
+
+func TestInviteEmailConflictDoesNotConsumeUse(t *testing.T) {
+	api, adminID, cleanup := testFixture(t)
+	defer cleanup()
+	adminToken := testAdminToken(t, api, adminID)
+	handler := testRouter(api)
+	inviteID, code := createTestInvite(t, handler, adminToken, 1)
+
+	conflict := registerWithInvite(t, handler, "user@example.test", code)
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("重复邮箱注册应返回 409，得到 %d：%s", conflict.Code, conflict.Body.String())
+	}
+	var uses int
+	if err := api.db.QueryRow(context.Background(),
+		`SELECT uses FROM invite_codes WHERE id = $1`, inviteID,
+	).Scan(&uses); err != nil {
+		t.Fatalf("查询冲突后的使用次数失败: %v", err)
+	}
+	if uses != 0 {
+		t.Fatalf("邮箱冲突不应消耗邀请码，实际 uses=%d", uses)
+	}
+
+	registered := registerWithInvite(t, handler, "after-conflict@example.test", code)
+	if registered.Code != http.StatusCreated {
+		t.Fatalf("冲突未消耗次数，后续有效注册应成功，得到 %d：%s", registered.Code, registered.Body.String())
+	}
+}
+
+func TestConcurrentInviteRegistrationsRespectUseLimit(t *testing.T) {
+	api, adminID, cleanup := testFixture(t)
+	defer cleanup()
+	adminToken := testAdminToken(t, api, adminID)
+	_, code := createTestInvite(t, testRouter(api), adminToken, 3)
+	handler := http.HandlerFunc(api.register)
+
+	const requests = 10
+	responses := make([]int, requests)
+	var wg sync.WaitGroup
+	wg.Add(requests)
+	for i := range requests {
+		go func(i int) {
+			defer wg.Done()
+			response := registerWithInvite(t, handler,
+				fmt.Sprintf("parallel-%d@example.test", i), code)
+			responses[i] = response.Code
+		}(i)
+	}
+	wg.Wait()
+
+	created, rejected := 0, 0
+	for _, status := range responses {
+		switch status {
+		case http.StatusCreated:
+			created++
+		case http.StatusForbidden:
+			rejected++
+		default:
+			t.Fatalf("并发注册得到意外状态码 %d", status)
+		}
+	}
+	if created != 3 || rejected != requests-3 {
+		t.Fatalf("邀请码最多应成功使用 3 次；成功 %d 次，拒绝 %d 次", created, rejected)
+	}
+}
+
+func TestNonAdminCannotCreateOrRevokeInvites(t *testing.T) {
+	api, userID, cleanup := testFixture(t)
+	defer cleanup()
+	handler := testRouter(api)
+	token := testToken(t, api, userID)
+
+	createDenied := testRequest(t, handler, http.MethodPost, "/v1/admin/invites", token,
+		map[string]any{"max_uses": 1})
+	if createDenied.Code != http.StatusForbidden {
+		t.Fatalf("普通用户创建邀请码应返回 403，得到 %d：%s", createDenied.Code, createDenied.Body.String())
+	}
+
+	adminToken := testAdminToken(t, api, userID)
+	inviteID, _ := createTestInvite(t, handler, adminToken, 1)
+	if _, err := api.db.Exec(context.Background(),
+		`UPDATE users SET role = 'user' WHERE id = $1`, userID,
+	); err != nil {
+		t.Fatalf("将测试账号降为普通用户失败: %v", err)
+	}
+	revokeDenied := testRequest(t, handler, http.MethodDelete,
+		fmt.Sprintf("/v1/admin/invites/%d", inviteID), adminToken, nil)
+	if revokeDenied.Code != http.StatusForbidden {
+		t.Fatalf("普通用户撤销邀请码应返回 403，得到 %d：%s", revokeDenied.Code, revokeDenied.Body.String())
+	}
+	var isRevoked bool
+	if err := api.db.QueryRow(context.Background(),
+		`SELECT revoked_at IS NOT NULL FROM invite_codes WHERE id = $1`, inviteID,
+	).Scan(&isRevoked); err != nil {
+		t.Fatalf("检查邀请码撤销状态失败: %v", err)
+	}
+	if isRevoked {
+		t.Fatal("普通用户请求不应撤销邀请码")
+	}
+}
+
+func TestLegacyInviteOnlyWorksBeforeFirstAdmin(t *testing.T) {
+	t.Run("before admin exists", func(t *testing.T) {
+		api, _, cleanup := testFixture(t)
+		defer cleanup()
+		response := registerWithInvite(t, http.HandlerFunc(api.register),
+			"legacy-before-admin@example.test", "test-invite")
+		if response.Code != http.StatusCreated {
+			t.Fatalf("尚无管理员时旧邀请码应兼容注册，得到 %d：%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("after admin exists", func(t *testing.T) {
+		api, adminID, cleanup := testFixture(t)
+		defer cleanup()
+		testAdminToken(t, api, adminID)
+		response := registerWithInvite(t, http.HandlerFunc(api.register),
+			"legacy-after-admin@example.test", "test-invite")
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("已有管理员后旧邀请码应失效，得到 %d：%s", response.Code, response.Body.String())
+		}
+	})
 }

@@ -60,7 +60,7 @@ func (l *rateLimiter) allow(key string, capacity float64, refillPerSecond float6
 		return true, 0
 	}
 
-	wait := time.Duration(math.Ceil((1-bucket.tokens)/refillPerSecond*float64(time.Second)))
+	wait := time.Duration(math.Ceil((1 - bucket.tokens) / refillPerSecond * float64(time.Second)))
 	return false, wait
 }
 

@@ -84,3 +84,48 @@ func (a *API) changeMyPassword(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusNoContent)
 }
+
+func (a *API) revokeMySessions(w http.ResponseWriter, r *http.Request) {
+	userID, err := a.authenticatedUserID(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+
+	tx, err := a.db.Begin(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	var status string
+	err = tx.QueryRow(r.Context(),
+		`SELECT status FROM users WHERE id = $1 FOR UPDATE`,
+		userID,
+	).Scan(&status)
+	if err != nil || status != "active" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+
+	if _, err := tx.Exec(r.Context(),
+		`UPDATE users
+		 SET token_version = token_version + 1
+		 WHERE id = $1`,
+		userID,
+	); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	if err := insertAudit(r, tx, userID, "revoke_sessions", "user", userID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}

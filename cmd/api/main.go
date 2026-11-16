@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -87,32 +86,6 @@ func main() {
 	}
 
 	api := &API{db: db, jwtSecret: []byte(jwtSecret), inviteCode: inviteCode}
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", api.health)
-	mux.HandleFunc("POST /v1/auth/register", api.register)
-	mux.HandleFunc("POST /v1/auth/login", api.login)
-	mux.HandleFunc("GET /v1/me", api.me)
-	mux.HandleFunc("POST /v1/me/password", api.changeMyPassword)
-	mux.HandleFunc("GET /v1/devices", api.listDevices)
-	mux.HandleFunc("POST /v1/devices", api.createDevice)
-	mux.HandleFunc("PATCH /v1/devices/{id}", api.renameMyDevice)
-	mux.HandleFunc("DELETE /v1/devices/{id}", api.revokeDevice)
-	mux.HandleFunc("GET /v1/me/subscription", api.getMySubscription)
-	mux.HandleFunc("GET /v1/admin/users", api.adminListUsers)
-	mux.HandleFunc("PATCH /v1/admin/users/{id}/status", api.adminSetUserStatus)
-	mux.HandleFunc("GET /v1/admin/plans", api.adminListPlans)
-	mux.HandleFunc("POST /v1/admin/plans", api.adminCreatePlan)
-	mux.HandleFunc("PATCH /v1/admin/plans/{id}/status", api.adminSetPlanStatus)
-	mux.HandleFunc("POST /v1/admin/users/{id}/subscriptions", api.adminCreateSubscription)
-	mux.HandleFunc("GET /v1/admin/users/{id}/devices", api.adminListUserDevices)
-	mux.HandleFunc("DELETE /v1/admin/users/{id}/devices/{deviceID}", api.adminRevokeUserDevice)
-	mux.HandleFunc("GET /v1/admin/subscriptions", api.adminListSubscriptions)
-	mux.HandleFunc("POST /v1/admin/subscriptions/{id}/cancel", api.adminCancelSubscription)
-	mux.HandleFunc("GET /v1/admin/audit-logs", api.adminListAuditLogs)
-	mux.HandleFunc("GET /admin", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/admin/", http.StatusTemporaryRedirect)
-	})
-	mux.Handle("GET /admin/", http.StripPrefix("/admin/", adminUIHandler()))
 
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
@@ -121,7 +94,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           apiMiddleware(mux),
+		Handler:           newRouter(api),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -150,7 +123,7 @@ func main() {
 		}
 	}()
 
-	err := server.ListenAndServe()
+	err = server.ListenAndServe()
 	if !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
@@ -186,19 +159,31 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "password_must_be_12_to_72_bytes"})
 		return
 	}
-	if subtle.ConstantTimeCompare([]byte(in.InviteCode), []byte(a.inviteCode)) != 1 {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid_invite_code"})
-		return
-	}
-
 	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
 
+	tx, err := a.db.Begin(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	inviteID, inviteValid, err := a.authorizeInvite(r.Context(), tx, in.InviteCode)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	if !inviteValid {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid_invite_code"})
+		return
+	}
+
 	var u user
-	err = a.db.QueryRow(r.Context(),
+	err = tx.QueryRow(r.Context(),
 		`INSERT INTO users (email, password_hash)
 		 VALUES ($1, $2)
 		 ON CONFLICT (email) DO NOTHING
@@ -211,6 +196,19 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	if inviteID > 0 {
+		if _, err := tx.Exec(r.Context(),
+			`UPDATE invite_codes SET uses = uses + 1 WHERE id = $1`,
+			inviteID,
+		); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+			return
+		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
@@ -364,7 +362,6 @@ func (a *API) createDevice(w http.ResponseWriter, r *http.Request) {
 		   AND s.status = 'active'
 		   AND s.starts_at <= NOW()
 		   AND s.ends_at > NOW()
-		   AND p.active = TRUE
 		 ORDER BY s.ends_at DESC
 		 LIMIT 1`,
 		userID,
@@ -407,6 +404,10 @@ func (a *API) createDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	if err := insertAudit(r, tx, userID, "register_device", "device", d.ID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
@@ -466,18 +467,35 @@ func (a *API) revokeDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := a.db.Exec(r.Context(),
-		`UPDATE devices
-		 SET revoked_at = NOW()
-		 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`,
-		deviceID, userID,
-	)
+	tx, err := a.db.Begin(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
-	if result.RowsAffected() == 0 {
+	defer tx.Rollback(r.Context())
+
+	var revokedID int64
+	err = tx.QueryRow(r.Context(),
+		`UPDATE devices
+		 SET revoked_at = NOW()
+		 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+		 RETURNING id`,
+		deviceID, userID,
+	).Scan(&revokedID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "device_not_found_or_already_revoked"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	if err := insertAudit(r, tx, userID, "revoke_device", "device", revokedID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

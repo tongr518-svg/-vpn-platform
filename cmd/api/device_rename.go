@@ -37,8 +37,15 @@ func (a *API) renameMyDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tx, err := a.db.Begin(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	defer tx.Rollback(r.Context())
+
 	var d device
-	err = a.db.QueryRow(r.Context(),
+	err = tx.QueryRow(r.Context(),
 		`UPDATE devices
 		 SET name = $1
 		 WHERE id = $2
@@ -63,6 +70,14 @@ func (a *API) renameMyDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	if err := insertAudit(r, tx, userID, "rename_device", "device", d.ID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
