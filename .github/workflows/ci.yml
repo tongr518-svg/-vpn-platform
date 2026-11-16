@@ -98,7 +98,18 @@ jobs:
           exit "$failed"
 
       - name: Analyze
-        run: flutter analyze
+        shell: bash
+        run: |
+          set +e
+          output="$(flutter analyze 2>&1)"
+          result=$?
+          printf '%s\n' "$output"
+          if [ "$result" -ne 0 ]; then
+            while IFS= read -r line; do
+              echo "::error::$line"
+            done <<< "$output"
+          fi
+          exit "$result"
 
       - name: Test
         run: flutter test
