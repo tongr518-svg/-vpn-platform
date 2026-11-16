@@ -20,6 +20,10 @@ type nodeRecord struct {
 	HealthStatus     string     `json:"health_status"`
 	Capacity         int        `json:"capacity"`
 	AssignedDevices  int        `json:"assigned_device_count"`
+	DesiredVersion   int64      `json:"desired_config_version"`
+	AckVersion       int64      `json:"acknowledged_config_version"`
+	SyncPending      bool       `json:"sync_pending"`
+	LastSyncAt       *time.Time `json:"last_sync_at,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 	LastHeartbeatAt  *time.Time `json:"last_heartbeat_at,omitempty"`
 	CredentialActive bool       `json:"credential_active"`
@@ -49,7 +53,9 @@ const nodeSelectColumns = `id, name, region, status, capacity, created_at,
 	     THEN 'online' ELSE 'offline' END,
 	(SELECT COUNT(*)::int FROM node_device_assignments a
 	 JOIN devices d ON d.id = a.device_id
-	 WHERE a.node_id = nodes.id AND d.revoked_at IS NULL)`
+	 WHERE a.node_id = nodes.id AND d.revoked_at IS NULL),
+	desired_config_version, acknowledged_config_version,
+	(acknowledged_config_version < desired_config_version), last_sync_at`
 
 func generateNodeCredential() (string, [32]byte, error) {
 	var raw [32]byte
@@ -150,6 +156,7 @@ func (a *API) adminListNodes(w http.ResponseWriter, r *http.Request) {
 			&node.ID, &node.Name, &node.Region, &node.Status,
 			&node.Capacity, &node.CreatedAt, &node.LastHeartbeatAt,
 			&node.CredentialActive, &node.HealthStatus, &node.AssignedDevices,
+			&node.DesiredVersion, &node.AckVersion, &node.SyncPending, &node.LastSyncAt,
 		); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 			return
@@ -239,12 +246,15 @@ func (a *API) adminUpdateNode(w http.ResponseWriter, r *http.Request) {
 		                THEN 'online' ELSE 'offline' END,
 		           (SELECT COUNT(*)::int FROM node_device_assignments a
 		            JOIN devices d ON d.id = a.device_id
-		            WHERE a.node_id = nodes.id AND d.revoked_at IS NULL)`,
+		            WHERE a.node_id = nodes.id AND d.revoked_at IS NULL),
+		           desired_config_version, acknowledged_config_version,
+		           (acknowledged_config_version < desired_config_version), last_sync_at`,
 		name, region, capacity, nodeID,
 	).Scan(
 		&node.ID, &node.Name, &node.Region, &node.Status, &node.Capacity,
 		&node.CreatedAt, &node.LastHeartbeatAt, &node.CredentialActive,
 		&node.HealthStatus, &node.AssignedDevices,
+		&node.DesiredVersion, &node.AckVersion, &node.SyncPending, &node.LastSyncAt,
 	)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
@@ -300,12 +310,15 @@ func (a *API) adminSetNodeStatus(w http.ResponseWriter, r *http.Request) {
 		                THEN 'online' ELSE 'offline' END,
 		           (SELECT COUNT(*)::int FROM node_device_assignments a
 		            JOIN devices d ON d.id = a.device_id
-		            WHERE a.node_id = nodes.id AND d.revoked_at IS NULL)`,
+		            WHERE a.node_id = nodes.id AND d.revoked_at IS NULL),
+		           desired_config_version, acknowledged_config_version,
+		           (acknowledged_config_version < desired_config_version), last_sync_at`,
 		in.Status, nodeID,
 	).Scan(
 		&node.ID, &node.Name, &node.Region, &node.Status, &node.Capacity,
 		&node.CreatedAt, &node.LastHeartbeatAt, &node.CredentialActive,
 		&node.HealthStatus, &node.AssignedDevices,
+		&node.DesiredVersion, &node.AckVersion, &node.SyncPending, &node.LastSyncAt,
 	)
 	if err == pgx.ErrNoRows {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "node_not_found"})

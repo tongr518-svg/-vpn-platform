@@ -160,6 +160,10 @@ func (a *API) adminAssignDeviceToNode(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
+	if err := recordNodeConfigChange(r.Context(), tx, in.NodeID, "device_assigned", deviceID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
 	assignment.DeviceID = deviceID
 	assignment.NodeID = in.NodeID
 	err = tx.QueryRow(r.Context(), `SELECT name FROM nodes WHERE id = $1`, in.NodeID).Scan(&assignment.NodeName)
@@ -232,6 +236,10 @@ func (a *API) adminUnassignDeviceFromNode(w http.ResponseWriter, r *http.Request
 	}
 	if result.RowsAffected() == 0 {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "device_not_assigned"})
+		return
+	}
+	if err := recordNodeConfigChange(r.Context(), tx, nodeID, "device_unassigned", deviceID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
 	if err := insertAudit(r, tx, actorID, "unassign_device_node", "device", deviceID); err != nil {

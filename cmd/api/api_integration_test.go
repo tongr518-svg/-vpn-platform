@@ -835,6 +835,175 @@ func TestConcurrentDeviceAssignmentsRespectNodeCapacity(t *testing.T) {
 	}
 }
 
+func TestNodeConfigOutboxSnapshotAndAcknowledgement(t *testing.T) {
+	api, adminID, cleanup := testFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := api.db.Exec(ctx, `UPDATE users SET role = 'admin' WHERE id = $1`, adminID); err != nil {
+		t.Fatalf("设置测试管理员失败: %v", err)
+	}
+	addActiveTestPlan(t, api, adminID, 4)
+	adminToken := testToken(t, api, adminID)
+	handler := testRouter(api)
+
+	createNode := func(name string) (int64, string) {
+		t.Helper()
+		response := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
+			map[string]any{"name": name, "region": "test", "capacity": 4})
+		if response.Code != http.StatusCreated {
+			t.Fatalf("创建节点失败，得到 %d：%s", response.Code, response.Body.String())
+		}
+		var payload struct {
+			Node struct {
+				ID int64 `json:"id"`
+			} `json:"node"`
+			Credential string `json:"credential"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("解析节点响应失败: %v", err)
+		}
+		return payload.Node.ID, payload.Credential
+	}
+	nodeA, credentialA := createNode("sync-node-a")
+	nodeB, credentialB := createNode("sync-node-b")
+	keyA, keyB := testPublicKey(51), testPublicKey(52)
+	deviceA := addTestDevice(t, api, adminID, "sync-device-a", 51)
+	deviceB := addTestDevice(t, api, adminID, "sync-device-b", 52)
+	assign := func(deviceID, nodeID int64) *httptest.ResponseRecorder {
+		t.Helper()
+		return testRequest(t, handler, http.MethodPut,
+			fmt.Sprintf("/v1/admin/devices/%d/assignment", deviceID), adminToken,
+			map[string]int64{"node_id": nodeID})
+	}
+	if response := assign(deviceA, nodeA); response.Code != http.StatusCreated {
+		t.Fatalf("分配设备到节点 A 失败：%d %s", response.Code, response.Body.String())
+	}
+	if response := assign(deviceB, nodeB); response.Code != http.StatusCreated {
+		t.Fatalf("分配设备到节点 B 失败：%d %s", response.Code, response.Body.String())
+	}
+
+	pull := func(credential string) *httptest.ResponseRecorder {
+		t.Helper()
+		return testRequest(t, handler, http.MethodGet, "/v1/node/config", credential, nil)
+	}
+	snapshotA := pull(credentialA)
+	if snapshotA.Code != http.StatusOK {
+		t.Fatalf("节点 A 拉取快照失败：%d %s", snapshotA.Code, snapshotA.Body.String())
+	}
+	var configA struct {
+		NodeID  int64 `json:"node_id"`
+		Version int64 `json:"version"`
+		Devices []struct {
+			DeviceID  int64  `json:"device_id"`
+			PublicKey string `json:"public_key"`
+			Platform  string `json:"platform"`
+		} `json:"devices"`
+	}
+	if err := json.Unmarshal(snapshotA.Body.Bytes(), &configA); err != nil {
+		t.Fatalf("解析节点 A 快照失败: %v", err)
+	}
+	if configA.NodeID != nodeA || configA.Version != 1 || len(configA.Devices) != 1 ||
+		configA.Devices[0].DeviceID != deviceA || configA.Devices[0].PublicKey != keyA {
+		t.Fatalf("节点 A 快照内容不符合预期：%s", snapshotA.Body.String())
+	}
+	if bytes.Contains(snapshotA.Body.Bytes(), []byte(keyB)) ||
+		bytes.Contains(snapshotA.Body.Bytes(), []byte("password_hash")) ||
+		bytes.Contains(snapshotA.Body.Bytes(), []byte("private_key")) {
+		t.Fatalf("节点 A 快照包含其他节点设备或敏感字段：%s", snapshotA.Body.String())
+	}
+	repeated := pull(credentialA)
+	if repeated.Code != http.StatusOK || !bytes.Equal(snapshotA.Body.Bytes(), repeated.Body.Bytes()) {
+		t.Fatalf("相同状态重复拉取应返回稳定快照：首次 %s，再次 %s", snapshotA.Body.String(), repeated.Body.String())
+	}
+
+	snapshotB := pull(credentialB)
+	var configB struct {
+		NodeID  int64 `json:"node_id"`
+		Version int64 `json:"version"`
+		Devices []struct {
+			DeviceID  int64  `json:"device_id"`
+			PublicKey string `json:"public_key"`
+		} `json:"devices"`
+	}
+	if snapshotB.Code != http.StatusOK || json.Unmarshal(snapshotB.Body.Bytes(), &configB) != nil {
+		t.Fatalf("节点 B 快照读取失败：%d %s", snapshotB.Code, snapshotB.Body.String())
+	}
+	if configB.NodeID != nodeB || configB.Version != 1 || len(configB.Devices) != 1 || configB.Devices[0].PublicKey != keyB {
+		t.Fatalf("节点 B 不应读取节点 A 的设备：%s", snapshotB.Body.String())
+	}
+
+	ack := func(credential string, version int64) *httptest.ResponseRecorder {
+		t.Helper()
+		return testRequest(t, handler, http.MethodPost, "/v1/node/config/ack", credential,
+			map[string]int64{"version": version})
+	}
+	if response := ack(credentialA, 2); response.Code != http.StatusConflict {
+		t.Fatalf("确认尚不存在的超前版本应返回 409，得到 %d：%s", response.Code, response.Body.String())
+	}
+	for i := 0; i < 2; i++ {
+		if response := ack(credentialA, 1); response.Code != http.StatusNoContent {
+			t.Fatalf("确认并重复确认版本 1 应成功，得到 %d：%s", response.Code, response.Body.String())
+		}
+	}
+
+	unassign := testRequest(t, handler, http.MethodDelete,
+		fmt.Sprintf("/v1/admin/devices/%d/assignment", deviceA), adminToken, nil)
+	if unassign.Code != http.StatusNoContent {
+		t.Fatalf("解除节点 A 分配失败：%d %s", unassign.Code, unassign.Body.String())
+	}
+	updatedSnapshot := pull(credentialA)
+	if updatedSnapshot.Code != http.StatusOK {
+		t.Fatalf("拉取更新快照失败：%d %s", updatedSnapshot.Code, updatedSnapshot.Body.String())
+	}
+	if err := json.Unmarshal(updatedSnapshot.Body.Bytes(), &configA); err != nil {
+		t.Fatalf("解析更新快照失败: %v", err)
+	}
+	if configA.Version != 2 || len(configA.Devices) != 0 {
+		t.Fatalf("解除分配后期望版本应递增且快照为空：%s", updatedSnapshot.Body.String())
+	}
+	if response := ack(credentialA, 2); response.Code != http.StatusNoContent {
+		t.Fatalf("确认最新版本应成功，得到 %d：%s", response.Code, response.Body.String())
+	}
+	if response := ack(credentialA, 1); response.Code != http.StatusConflict {
+		t.Fatalf("旧版本不得回退确认状态，得到 %d：%s", response.Code, response.Body.String())
+	}
+
+	var outboxCount int
+	if err := api.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM node_config_outbox WHERE node_id = $1`, nodeA,
+	).Scan(&outboxCount); err != nil {
+		t.Fatalf("查询节点 A outbox 失败: %v", err)
+	}
+	if outboxCount != 2 {
+		t.Fatalf("节点 A 分配和解除应各有一条 outbox 记录，实际为 %d", outboxCount)
+	}
+	var desiredVersion, ackVersion int64
+	var syncPending bool
+	var lastSyncAt *time.Time
+	if err := api.db.QueryRow(ctx,
+		`SELECT desired_config_version, acknowledged_config_version,
+		        acknowledged_config_version < desired_config_version, last_sync_at
+		 FROM nodes WHERE id = $1`, nodeA,
+	).Scan(&desiredVersion, &ackVersion, &syncPending, &lastSyncAt); err != nil {
+		t.Fatalf("查询节点同步状态失败: %v", err)
+	}
+	if desiredVersion != 2 || ackVersion != 2 || syncPending || lastSyncAt == nil {
+		t.Fatalf("节点同步状态不正确：desired=%d ack=%d pending=%v last_sync=%v", desiredVersion, ackVersion, syncPending, lastSyncAt)
+	}
+
+	revoke := testRequest(t, handler, http.MethodDelete,
+		fmt.Sprintf("/v1/admin/nodes/%d/credentials", nodeA), adminToken, nil)
+	if revoke.Code != http.StatusNoContent {
+		t.Fatalf("撤销节点凭据失败：%d %s", revoke.Code, revoke.Body.String())
+	}
+	if response := pull(credentialA); response.Code != http.StatusUnauthorized {
+		t.Fatalf("撤销凭据后节点不得继续拉取配置，得到 %d", response.Code)
+	}
+	if response := ack(credentialA, 2); response.Code != http.StatusUnauthorized {
+		t.Fatalf("撤销凭据后节点不得确认配置，得到 %d", response.Code)
+	}
+}
+
 func TestListMySubscriptionsShowsHistoryAndOnlyOwnRecords(t *testing.T) {
 	api, userID, cleanup := testFixture(t)
 	defer cleanup()

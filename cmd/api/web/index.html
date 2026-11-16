@@ -146,7 +146,7 @@
       </form>
       <p class="muted">节点凭据仅在创建或轮换时显示一次。心跳只更新控制面状态；此版本不配置隧道或转发流量。</p>
       <table>
-        <thead><tr><th>ID</th><th>名称</th><th>区域</th><th>管理状态</th><th>健康状态</th><th>容量/已分配</th><th>最近心跳</th><th>凭据</th><th>操作</th></tr></thead>
+        <thead><tr><th>ID</th><th>名称</th><th>区域</th><th>管理状态</th><th>健康状态</th><th>容量/已分配</th><th>期望/确认版本</th><th>同步状态</th><th>最后同步</th><th>最近心跳</th><th>凭据</th><th>操作</th></tr></thead>
         <tbody id="nodesBody"></tbody>
       </table>
     </section>
@@ -488,6 +488,9 @@
       cell(tr, { active: "运行", maintenance: "维护", disabled: "停用" }[node.status] || node.status);
       cell(tr, { online: "在线", offline: "心跳过期/离线" }[node.health_status] || node.health_status);
       cell(tr, `${node.capacity} / ${node.assigned_device_count}`);
+      cell(tr, `${node.desired_config_version} / ${node.acknowledged_config_version}`);
+      cell(tr, node.sync_pending ? "待同步" : "已同步");
+      cell(tr, dateText(node.last_sync_at) || "尚未确认");
       cell(tr, dateText(node.last_heartbeat_at) || "尚无心跳");
       cell(tr, node.credential_active ? "有效" : "已撤销");
 

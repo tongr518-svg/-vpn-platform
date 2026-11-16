@@ -490,6 +490,10 @@ func (a *API) revokeDevice(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
+	if err := addDeviceConfigOutboxForRevocation(r.Context(), tx, revokedID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
 	if err := insertAudit(r, tx, userID, "revoke_device", "device", revokedID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return

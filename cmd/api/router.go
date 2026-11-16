@@ -43,6 +43,8 @@ func newRouter(api *API) http.Handler {
 	mux.HandleFunc("POST /v1/admin/nodes/{id}/credentials/rotate", api.adminRotateNodeCredential)
 	mux.HandleFunc("DELETE /v1/admin/nodes/{id}/credentials", api.adminRevokeNodeCredential)
 	mux.HandleFunc("POST /v1/node/heartbeat", api.nodeHeartbeat)
+	mux.HandleFunc("GET /v1/node/config", api.nodeConfig)
+	mux.HandleFunc("POST /v1/node/config/ack", api.acknowledgeNodeConfig)
 
 	mux.HandleFunc("GET /admin", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin/", http.StatusTemporaryRedirect)
