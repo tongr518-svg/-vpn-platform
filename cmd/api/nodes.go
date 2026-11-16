@@ -17,7 +17,9 @@ type nodeRecord struct {
 	Name             string     `json:"name"`
 	Region           string     `json:"region"`
 	Status           string     `json:"status"`
+	HealthStatus     string     `json:"health_status"`
 	Capacity         int        `json:"capacity"`
+	AssignedDevices  int        `json:"assigned_device_count"`
 	CreatedAt        time.Time  `json:"created_at"`
 	LastHeartbeatAt  *time.Time `json:"last_heartbeat_at,omitempty"`
 	CredentialActive bool       `json:"credential_active"`
@@ -42,7 +44,12 @@ type setNodeStatusRequest struct {
 const nodeSelectColumns = `id, name, region, status, capacity, created_at,
 	last_heartbeat_at,
 	EXISTS (SELECT 1 FROM node_credentials c
-	        WHERE c.node_id = nodes.id AND c.revoked_at IS NULL)`
+	        WHERE c.node_id = nodes.id AND c.revoked_at IS NULL),
+	CASE WHEN last_heartbeat_at > NOW() - INTERVAL '90 seconds'
+	     THEN 'online' ELSE 'offline' END,
+	(SELECT COUNT(*)::int FROM node_device_assignments a
+	 JOIN devices d ON d.id = a.device_id
+	 WHERE a.node_id = nodes.id AND d.revoked_at IS NULL)`
 
 func generateNodeCredential() (string, [32]byte, error) {
 	var raw [32]byte
@@ -115,6 +122,7 @@ func (a *API) adminCreateNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	node.CredentialActive = true
+	node.HealthStatus = "offline"
 	writeJSON(w, http.StatusCreated, map[string]any{"node": node, "credential": credential})
 }
 
@@ -141,7 +149,7 @@ func (a *API) adminListNodes(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Scan(
 			&node.ID, &node.Name, &node.Region, &node.Status,
 			&node.Capacity, &node.CreatedAt, &node.LastHeartbeatAt,
-			&node.CredentialActive,
+			&node.CredentialActive, &node.HealthStatus, &node.AssignedDevices,
 		); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 			return
@@ -182,10 +190,14 @@ func (a *API) adminUpdateNode(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(r.Context())
 
 	var name, region string
-	var capacity int
+	var capacity, assignedDevices int
 	err = tx.QueryRow(r.Context(),
-		`SELECT name, region, capacity FROM nodes WHERE id = $1 FOR UPDATE`, nodeID,
-	).Scan(&name, &region, &capacity)
+		`SELECT n.name, n.region, n.capacity,
+		        (SELECT COUNT(*)::int FROM node_device_assignments a
+		         JOIN devices d ON d.id = a.device_id
+		         WHERE a.node_id = n.id AND d.revoked_at IS NULL)
+		 FROM nodes n WHERE n.id = $1 FOR UPDATE`, nodeID,
+	).Scan(&name, &region, &capacity, &assignedDevices)
 	if err == pgx.ErrNoRows {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "node_not_found"})
 		return
@@ -207,6 +219,13 @@ func (a *API) adminUpdateNode(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_node"})
 		return
 	}
+	if capacity < assignedDevices {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":                 "node_capacity_below_assigned_devices",
+			"assigned_device_count": assignedDevices,
+		})
+		return
+	}
 
 	var node nodeRecord
 	err = tx.QueryRow(r.Context(),
@@ -215,11 +234,17 @@ func (a *API) adminUpdateNode(w http.ResponseWriter, r *http.Request) {
 		 RETURNING id, name, region, status, capacity, created_at,
 		           last_heartbeat_at,
 		           EXISTS (SELECT 1 FROM node_credentials c
-		                   WHERE c.node_id = nodes.id AND c.revoked_at IS NULL)`,
+		                   WHERE c.node_id = nodes.id AND c.revoked_at IS NULL),
+		           CASE WHEN last_heartbeat_at > NOW() - INTERVAL '90 seconds'
+		                THEN 'online' ELSE 'offline' END,
+		           (SELECT COUNT(*)::int FROM node_device_assignments a
+		            JOIN devices d ON d.id = a.device_id
+		            WHERE a.node_id = nodes.id AND d.revoked_at IS NULL)`,
 		name, region, capacity, nodeID,
 	).Scan(
 		&node.ID, &node.Name, &node.Region, &node.Status, &node.Capacity,
 		&node.CreatedAt, &node.LastHeartbeatAt, &node.CredentialActive,
+		&node.HealthStatus, &node.AssignedDevices,
 	)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
@@ -270,11 +295,17 @@ func (a *API) adminSetNodeStatus(w http.ResponseWriter, r *http.Request) {
 		 RETURNING id, name, region, status, capacity, created_at,
 		           last_heartbeat_at,
 		           EXISTS (SELECT 1 FROM node_credentials c
-		                   WHERE c.node_id = nodes.id AND c.revoked_at IS NULL)`,
+		                   WHERE c.node_id = nodes.id AND c.revoked_at IS NULL),
+		           CASE WHEN last_heartbeat_at > NOW() - INTERVAL '90 seconds'
+		                THEN 'online' ELSE 'offline' END,
+		           (SELECT COUNT(*)::int FROM node_device_assignments a
+		            JOIN devices d ON d.id = a.device_id
+		            WHERE a.node_id = nodes.id AND d.revoked_at IS NULL)`,
 		in.Status, nodeID,
 	).Scan(
 		&node.ID, &node.Name, &node.Region, &node.Status, &node.Capacity,
 		&node.CreatedAt, &node.LastHeartbeatAt, &node.CredentialActive,
+		&node.HealthStatus, &node.AssignedDevices,
 	)
 	if err == pgx.ErrNoRows {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "node_not_found"})

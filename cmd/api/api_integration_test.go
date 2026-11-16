@@ -414,6 +414,164 @@ func TestNodeAdministrationAndCredentialLifecycle(t *testing.T) {
 	}
 }
 
+func TestNodeHealthStatusIsIndependentFromAdminStatus(t *testing.T) {
+	api, userID, cleanup := testFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := api.db.Exec(ctx, `UPDATE users SET role = 'admin' WHERE id = $1`, userID); err != nil {
+		t.Fatalf("设置测试管理员失败: %v", err)
+	}
+	handler := testRouter(api)
+	adminToken := testToken(t, api, userID)
+	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
+		map[string]any{"name": "health-node", "region": "test", "capacity": 5})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("创建测试节点失败，得到 %d：%s", created.Code, created.Body.String())
+	}
+	var payload struct {
+		Node struct {
+			ID     int64  `json:"id"`
+			Status string `json:"status"`
+			Health string `json:"health_status"`
+		} `json:"node"`
+		Credential string `json:"credential"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("解析节点响应失败: %v", err)
+	}
+	if payload.Node.Health != "offline" {
+		t.Fatalf("从未心跳的节点应为 offline，得到 %q", payload.Node.Health)
+	}
+
+	listHealth := func() (adminNode struct {
+		Status string `json:"status"`
+		Health string `json:"health_status"`
+	}) {
+		t.Helper()
+		response := testRequest(t, handler, http.MethodGet, "/v1/admin/nodes", adminToken, nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("查询节点失败，得到 %d：%s", response.Code, response.Body.String())
+		}
+		var nodes []json.RawMessage
+		if err := json.Unmarshal(response.Body.Bytes(), &nodes); err != nil || len(nodes) != 1 {
+			t.Fatalf("解析节点列表失败或节点数量不符：%s (%v)", response.Body.String(), err)
+		}
+		if err := json.Unmarshal(nodes[0], &adminNode); err != nil {
+			t.Fatalf("解析节点状态失败: %v", err)
+		}
+		return adminNode
+	}
+
+	if _, err := api.db.Exec(ctx,
+		`UPDATE nodes SET last_heartbeat_at = NOW() - INTERVAL '91 seconds' WHERE id = $1`, payload.Node.ID,
+	); err != nil {
+		t.Fatalf("设置过期心跳失败: %v", err)
+	}
+	if got := listHealth(); got.Health != "offline" {
+		t.Fatalf("91 秒前的心跳应为 offline，得到 %q", got.Health)
+	}
+	if _, err := api.db.Exec(ctx,
+		`UPDATE nodes SET last_heartbeat_at = NOW() - INTERVAL '89 seconds' WHERE id = $1`, payload.Node.ID,
+	); err != nil {
+		t.Fatalf("设置新鲜心跳失败: %v", err)
+	}
+	if got := listHealth(); got.Health != "online" {
+		t.Fatalf("89 秒前的心跳应为 online，得到 %q", got.Health)
+	}
+
+	maintenance := testRequest(t, handler, http.MethodPatch,
+		fmt.Sprintf("/v1/admin/nodes/%d/status", payload.Node.ID), adminToken,
+		map[string]string{"status": "maintenance"})
+	if maintenance.Code != http.StatusOK {
+		t.Fatalf("设置维护状态失败，得到 %d：%s", maintenance.Code, maintenance.Body.String())
+	}
+	response := testRequest(t, handler, http.MethodPost, "/v1/node/heartbeat", payload.Credential, nil)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("维护节点应接受有效心跳，得到 %d：%s", response.Code, response.Body.String())
+	}
+	if got := listHealth(); got.Status != "maintenance" || got.Health != "online" {
+		t.Fatalf("心跳不应覆盖管理员维护状态；status=%q health=%q", got.Status, got.Health)
+	}
+
+	revoke := testRequest(t, handler, http.MethodDelete,
+		fmt.Sprintf("/v1/admin/nodes/%d/credentials", payload.Node.ID), adminToken, nil)
+	if revoke.Code != http.StatusNoContent {
+		t.Fatalf("撤销节点凭据失败，得到 %d：%s", revoke.Code, revoke.Body.String())
+	}
+	response = testRequest(t, handler, http.MethodPost, "/v1/node/heartbeat", payload.Credential, nil)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("撤销凭据的心跳应返回 401，得到 %d", response.Code)
+	}
+}
+
+func TestNodeCapacityCannotDropBelowAssignedDevices(t *testing.T) {
+	api, userID, cleanup := testFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := api.db.Exec(ctx, `UPDATE users SET role = 'admin' WHERE id = $1`, userID); err != nil {
+		t.Fatalf("设置测试管理员失败: %v", err)
+	}
+	handler := testRouter(api)
+	adminToken := testToken(t, api, userID)
+	invalid := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
+		map[string]any{"name": "invalid-node", "region": "test", "capacity": 0})
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("容量为 0 的节点应返回 400，得到 %d", invalid.Code)
+	}
+	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
+		map[string]any{"name": "capacity-node", "region": "test", "capacity": 2})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("创建测试节点失败，得到 %d：%s", created.Code, created.Body.String())
+	}
+	var payload struct {
+		Node struct {
+			ID int64 `json:"id"`
+		} `json:"node"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("解析节点响应失败: %v", err)
+	}
+	nodeID := payload.Node.ID
+	for i := byte(20); i < 22; i++ {
+		var deviceID int64
+		if err := api.db.QueryRow(ctx,
+			`INSERT INTO devices (user_id, name, platform, public_key)
+			 VALUES ($1, $2, 'windows', $3) RETURNING id`,
+			userID, fmt.Sprintf("capacity-device-%d", i), testPublicKey(i),
+		).Scan(&deviceID); err != nil {
+			t.Fatalf("创建测试设备失败: %v", err)
+		}
+		if _, err := api.db.Exec(ctx,
+			`INSERT INTO node_device_assignments (node_id, device_id) VALUES ($1, $2)`, nodeID, deviceID,
+		); err != nil {
+			t.Fatalf("分配测试设备失败: %v", err)
+		}
+	}
+
+	boundary := testRequest(t, handler, http.MethodPatch, fmt.Sprintf("/v1/admin/nodes/%d", nodeID), adminToken,
+		map[string]int{"capacity": 2})
+	if boundary.Code != http.StatusOK {
+		t.Fatalf("容量等于已分配设备数时应允许，得到 %d：%s", boundary.Code, boundary.Body.String())
+	}
+	tooSmall := testRequest(t, handler, http.MethodPatch, fmt.Sprintf("/v1/admin/nodes/%d", nodeID), adminToken,
+		map[string]int{"capacity": 1})
+	if tooSmall.Code != http.StatusConflict {
+		t.Fatalf("容量低于已分配设备数应返回 409，得到 %d：%s", tooSmall.Code, tooSmall.Body.String())
+	}
+	invalid = testRequest(t, handler, http.MethodPatch, fmt.Sprintf("/v1/admin/nodes/%d", nodeID), adminToken,
+		map[string]int{"capacity": 1_000_001})
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("超过容量上限的修改应返回 400，得到 %d", invalid.Code)
+	}
+	var capacity int
+	if err := api.db.QueryRow(ctx, `SELECT capacity FROM nodes WHERE id = $1`, nodeID).Scan(&capacity); err != nil {
+		t.Fatalf("查询节点容量失败: %v", err)
+	}
+	if capacity != 2 {
+		t.Fatalf("被拒绝的容量修改不应改变数据库，当前容量为 %d", capacity)
+	}
+}
+
 func TestListMySubscriptionsShowsHistoryAndOnlyOwnRecords(t *testing.T) {
 	api, userID, cleanup := testFixture(t)
 	defer cleanup()

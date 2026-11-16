@@ -82,7 +82,7 @@ JWT 有效期为 12 小时。账号暂停或 `token_version` 变化后，旧 JWT
 | `DELETE` | `/v1/admin/invites/{id}` | 撤销邀请码并写入审计 |
 | `GET` | `/v1/admin/users/{id}/devices` | 查看用户设备，不返回公钥 |
 | `DELETE` | `/v1/admin/users/{id}/devices/{deviceID}` | 管理员撤销用户设备 |
-| `GET` | `/v1/admin/nodes` | 查询节点元数据、状态与最近心跳，不返回凭据 |
+| `GET` | `/v1/admin/nodes` | 查询节点元数据、管理状态、健康状态、容量和最近心跳，不返回凭据 |
 | `POST` | `/v1/admin/nodes` | 新增节点；节点凭据仅在响应中显示一次 |
 | `PATCH` | `/v1/admin/nodes/{id}` | 更新节点名称、区域或容量 |
 | `PATCH` | `/v1/admin/nodes/{id}/status` | 设置 `active`、`maintenance` 或 `disabled` |
@@ -98,7 +98,9 @@ JWT 有效期为 12 小时。账号暂停或 `token_version` 变化后，旧 JWT
 
 操作审计记录包括管理员后台操作、用户修改密码，以及用户设备注册、重命名和撤销。设备操作记录操作者、动作和设备 ID，不记录设备公钥、密码或 JWT。
 
-节点凭据由安全随机数生成，数据库只保存 SHA-256 哈希；创建和轮换响应会一次性返回明文凭据，列表和后续读取都不会再次返回。心跳只更新 `last_heartbeat_at`，`maintenance` 节点仍可上报，`disabled` 节点的心跳会被拒绝；撤销或轮换凭据会立即使旧凭据失效。节点状态和健康心跳目前只用于控制面运维，不建立 VPN 隧道或转发用户流量。
+节点凭据由安全随机数生成，数据库只保存 SHA-256 哈希；创建和轮换响应会一次性返回明文凭据，列表和后续读取都不会再次返回。`status` 是管理员设置的管理状态（`active`、`maintenance`、`disabled`）；`health_status` 是依据 `last_heartbeat_at` 单独计算的健康状态，最近 90 秒内有心跳为 `online`，否则为 `offline`。因此心跳过期不会覆盖管理状态。`maintenance` 节点仍可上报心跳，`disabled` 节点的心跳会被拒绝；撤销或轮换凭据会立即使旧凭据失效。
+
+节点列表中的 `assigned_device_count` 只统计未撤销设备。容量必须为 1 至 1,000,000；降低容量后若小于已分配设备数，更新返回 `409 node_capacity_below_assigned_devices`。节点分配记录表为后续控制面分配流程提供容量计数依据；当前尚无设备分配 API，也不建立 VPN 隧道或转发用户流量。
 
 邀请码原码由安全随机数生成，数据库只保存 SHA-256 哈希。管理员创建后需立即复制保存，之后列表只显示额度、状态和过期时间。注册会锁定邀请码并在同一事务中创建用户、增加使用次数；邮箱冲突或其他失败会回滚，不消耗额度。邀请码状态为 `active`、`exhausted`、`expired` 或 `revoked`。首位管理员创建正式邀请码后，旧 `INVITE_CODE` 不再接受；旧口令仅在数据库还没有任何管理员时兼容。
 
