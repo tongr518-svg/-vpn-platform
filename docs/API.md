@@ -96,7 +96,7 @@ JWT 有效期为 12 小时。账号暂停或 `token_version` 变化后，旧 JWT
 | `POST` | `/v1/node/config/dry-run` | 节点凭据提交已确认快照，服务端只校验并返回候选 peer 差异，不应用配置 |
 | `GET` | `/v1/node/config/signing-key` | 节点凭据获取 Ed25519 公钥；Agent 必须使用部署时固定的公钥验证签名 |
 | `GET` | `/v1/node/config/approval` | 获取当前节点、版本和候选摘要匹配的未过期审批包 |
-| `POST` | `/v1/node/config/approval/verify` | Agent 提交本地验证过的审批包；服务端核验签名并一次性消费 nonce |
+| `POST` | `/v1/node/config/approval/verify` | 应用成功后提交 `{"approval": ..., "applied": true}`；服务端核验并幂等记录应用确认 |
 | `POST` | `/v1/node/config/ack` | 节点确认已应用的快照版本，请求体为 `{"version": 1}` |
 
 用户状态请求体为 `{"status":"active"}` 或 `{"status":"suspended"}`；套餐启停请求体为 `{"active":true}` 或 `{"active":false}`。创建套餐字段为 `name`、`device_limit`、`concurrent_limit`、`data_limit_bytes`、`speed_limit_mbps`；流量和速度限制设为 `0` 表示不限。订阅开通字段为 `plan_id`、`starts_at`、`ends_at`，时间使用 RFC 3339 格式。
@@ -121,28 +121,33 @@ Agent 可用 `POST /v1/node/config/dry-run` 提交 `{"confirmed_snapshot": <此�
 
 管理员可提交 `{"candidate_version": 3}` 到节点审批接口。服务端仅接受与节点当前期望版本、最近一次有效 dry-run 和重新读取的候选快照摘要一致的审批；成功后使用服务端 Ed25519 私钥签发 10 分钟有效的一次性审批包，并在同一事务写入管理员审计记录。相同审批请求在仍有效时幂等返回原审批；候选版本或摘要变化后，旧审批无法再被 Agent 获取或验证。签名内容绑定节点 ID、候选版本、快照摘要、签发/过期时间和随机 nonce。
 
-Agent 应使用部署时固定的 Ed25519 公钥，在本地验证签名、目标节点 ID、当前 dry-run 版本和到期时间；`GET /v1/node/config/signing-key` 只便于查询公钥，不能作为未验证链路上的信任根。随后 Agent 可将审批包提交至 verify 接口；服务端再次核对签名、当前候选并原子消费 nonce，重复提交返回 `409 approval_replayed`。签名无效、版本/节点不符、候选已变化或审批过期均被拒绝。此流程只验证并消费审批，不应用配置；响应明确为 `applied: false`，后台没有配置应用按钮。服务端不会调用 `wg` 或连接节点配置接口。
+Agent 应使用部署时固定的 Ed25519 公钥，在本地验证签名、目标节点 ID、当前 dry-run 版本、候选摘要和到期时间；`GET /v1/node/config/signing-key` 只便于查询公钥，不能作为未验证链路上的信任根。应用成功后，Agent 才将审批包和 `applied: true` 提交至 verify 接口；服务端再次核对签名、当前候选并记录 `consumed_at`/`applied_at`。相同审批的确认重试幂等成功，未应用、签名无效、版本/节点不符、候选已变化或审批过期均被拒绝。`applied: true` 是已认证节点 Agent 的确认，不是控制面远程证明；Agent 必须在本地配置成功并将恢复日志持久化后才发送。服务端自身不会调用 `wg`。
 
-### 只读 Node Agent
+### 受限 Linux Node Agent
 
-独立 Agent 位于 `cmd/node-agent`，一次运行只会依次请求 `GET /v1/node/config`、`GET /v1/node/config/approval`，在本机完成快照校验、摘要计算和 Ed25519 审批验证，再调用 `POST /v1/node/config/approval/verify` 消费一次性 nonce。Agent 不会调用 dry-run 写入接口、确认配置接口或任何配置应用接口，也没有 WireGuard 配置生成、隧道或流量转发代码。成功响应要求 `applied: false`；已消费 nonce 会以文件标记保存在本地状态目录中，POSIX 系统使用 `0700` 目录和 `0600` 文件权限，其他系统应由运维设置等效的本机 ACL。服务器端仍是 nonce 一次性消费的最终防线。
+独立 Agent 位于 `cmd/node-agent`。默认运行只请求节点快照和审批，在本机校验快照、摘要、审批签名及有效期，生成仅包含 `[Interface] PrivateKey`、设备公钥和设备 `/32` 地址的 WireGuard peer 配置，并输出 peer 差异摘要；默认不调用系统命令、不修改接口、不消费审批。它不生成路由、`PostUp`、NAT 或防火墙规则。
 
-Agent 通过环境变量配置：`API_BASE_URL`、`NODE_ID`、`NODE_CREDENTIAL`、`APPROVAL_PUBLIC_KEY`（标准 Base64 Ed25519 公钥）和 `AGENT_STATE_DIR`。远程地址必须为 HTTPS；仅 loopback HTTP 可用于本机开发。节点凭据只从环境读取，不作为命令行参数。公钥必须通过受信任的运维渠道固定到 Agent 配置，不能在 Agent 启动时从控制面不经验证地下载。示例：
+Agent 通过环境变量配置：`API_BASE_URL`、`NODE_ID`、`NODE_CREDENTIAL`、`APPROVAL_PUBLIC_KEY`（标准 Base64 Ed25519 公钥）、`AGENT_STATE_DIR`、`WG_PRIVATE_KEY_FILE`、`WG_CONFIG_FILE` 和 `WG_INTERFACE`。私钥文件必填、不得为符号链接，且权限必须为 `0400` 或 `0600`（不得有组/其他权限）；配置及回滚文件以 `0600` 原子写入。远程地址必须为 HTTPS；仅 loopback HTTP 可用于本机开发。节点凭据只从环境读取，不作为命令行参数。公钥必须通过受信任的运维渠道固定到 Agent 配置，不能在 Agent 启动时从控制面不经验证地下载。示例：
 
-```powershell
-$env:API_BASE_URL = "https://control.example.test"
-$env:NODE_ID = "42"
-$env:NODE_CREDENTIAL = "<节点专属凭据>"
-$env:APPROVAL_PUBLIC_KEY = "<已核对并固定的 Ed25519 公钥 Base64>"
-$env:AGENT_STATE_DIR = "C:\ProgramData\vpn-platform-agent\state"
+```sh
+export API_BASE_URL="https://control.example.test"
+export NODE_ID="42"
+export NODE_CREDENTIAL="<节点专属凭据>"
+export APPROVAL_PUBLIC_KEY="<已核对并固定的 Ed25519 公钥 Base64>"
+export AGENT_STATE_DIR="/var/lib/vpn-platform-agent"
+export WG_PRIVATE_KEY_FILE="/etc/wireguard/wg-lab.key"
+export WG_CONFIG_FILE="/etc/wireguard/wg-lab.conf"
+export WG_INTERFACE="wg-lab"
 go run ./cmd/node-agent
 ```
 
-日志只输出节点 ID、版本、摘要和错误类别，不输出 Bearer 凭据、审批签名或私钥。审批签名 v1 覆盖 domain、节点 ID、候选版本、摘要、签发/到期 Unix 秒和 32 字节 nonce；审批最长有效 10 分钟。当前固定单一公钥，密钥轮换时应通过带 `key_id` 的受控公钥集合与重叠轮换窗口单独升级协议；签名私钥只留在控制面并放入受控密钥存储，`.env` 仅用于本地开发且不得提交。
+只有在隔离、可销毁的 Linux 测试节点上，预先创建并确认专用 `wg-lab` 接口后，才可显式运行 `go run ./cmd/node-agent --apply`。Agent 只对固定名称 `wg-lab` 调用 `wg showconf`/`wg setconf`；它不创建接口、不设置接口地址、不改路由、默认路由、防火墙或 NAT。不要把该开关用于承载真实用户流量的节点。配置先经严格本地解析校验并临时写入，再原子替换；上一个接口配置保存在权限受限的 `.previous` 文件中。apply 失败会恢复旧文件和接口配置。若进程在应用/确认之间崩溃，`0700` 状态目录中的 `0600` journal 会在下一次 `--apply` 时回滚未完成应用，或继续完成已应用配置的确认和版本 ack；不会把已消费但未应用状态报告为成功。默认 dry-run 不调用系统命令，也不发送确认请求。
 
-共享协议包和 Agent 的 golden/integration 单元测试在 CI 中运行，CI 另行构建 Agent。切换规范化摘要后，旧的 dry-run 摘要和审批不会再匹配；部署新版本后应重新生成 dry-run 并重新审批。
+日志只输出节点 ID、版本、摘要、peer 变化计数和错误类别，不输出 Bearer 凭据、审批签名或私钥。审批签名 v1 覆盖 domain、节点 ID、候选版本、摘要、签发/到期 Unix 秒和 32 字节 nonce；审批最长有效 10 分钟。当前固定单一公钥，密钥轮换时应通过带 `key_id` 的受控公钥集合与重叠轮换窗口单独升级协议；签名私钥只留在控制面并放入受控密钥存储，`.env` 仅用于本地开发且不得提交。
 
-解除分配或撤销设备后，对应地址会保持 `releasing` 并计入占用，直到 Agent 确认包含移除的配置版本；确认时服务端在事务中释放地址，之后才可复用。节点离线、同步失败或轮换凭据不会释放地址。变更节点 CIDR 需要先清空分配，并等待所有释放版本确认。迁移前创建的旧分配没有隧道地址；需在使用快照前解除并重新分配这些设备。此控制面仍不生成 WireGuard 配置、不建立隧道或转发用户流量。
+共享协议包和 Agent 的 golden/integration 单元测试在 CI 中运行。Agent 测试注入 fake executor，不触碰 CI runner 的网络接口；CI 另行构建 Agent。切换规范化摘要后，旧的 dry-run 摘要和审批不会再匹配；部署新版本后应重新生成 dry-run 并重新审批。
+
+解除分配或撤销设备后，对应地址会保持 `releasing` 并计入占用，直到 Agent 应用并确认包含移除的配置版本；确认时服务端在事务中释放地址，之后才可复用。节点离线、同步失败或轮换凭据不会释放地址。变更节点 CIDR 需要先清空分配，并等待所有释放版本确认。迁移前创建的旧分配没有隧道地址；需在使用快照前解除并重新分配这些设备。当前 Agent 仅能显式应用到隔离测试接口 `wg-lab`，仍不添加路由、防火墙、NAT 或流量转发。
 
 该同步内容只是控制面设备元数据和公钥快照，不包含可直接启用的 WireGuard 配置，不建立 VPN 隧道或转发用户流量。
 

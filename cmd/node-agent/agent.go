@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -27,14 +28,21 @@ type config struct {
 	Credential     string
 	PinnedKey      string
 	StateDirectory string
+	PrivateKeyFile string
+	ConfigFile     string
+	InterfaceName  string
+	Apply          bool
 }
 
 type agent struct {
-	config    config
-	client    *http.Client
-	publicKey ed25519.PublicKey
-	logger    io.Writer
-	now       func() time.Time
+	config     config
+	client     *http.Client
+	publicKey  ed25519.PublicKey
+	logger     io.Writer
+	now        func() time.Time
+	privateKey string
+	executor   wireGuardExecutor
+	platform   string
 }
 
 type apiError struct {
@@ -58,13 +66,29 @@ func newAgent(cfg config, logger io.Writer) (*agent, error) {
 	if cfg.StateDirectory == "" {
 		return nil, apiError{category: "invalid_agent_config"}
 	}
+	if cfg.InterfaceName == "" {
+		cfg.InterfaceName = testInterfaceName
+	}
+	if cfg.InterfaceName != testInterfaceName {
+		return nil, apiError{category: "unsafe_interface_rejected"}
+	}
+	privateKey, err := readPrivateKey(cfg.PrivateKeyFile)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.ConfigFile == "" || !filepath.IsAbs(cfg.ConfigFile) || filepath.Base(cfg.ConfigFile) != testInterfaceName+".conf" {
+		return nil, apiError{category: "invalid_config_path"}
+	}
 	cfg.BaseURL = strings.TrimRight(base.String(), "/")
 	return &agent{
-		config:    cfg,
-		client:    &http.Client{Timeout: 15 * time.Second},
-		publicKey: ed25519.PublicKey(key),
-		logger:    logger,
-		now:       time.Now,
+		config:     cfg,
+		client:     &http.Client{Timeout: 15 * time.Second},
+		publicKey:  ed25519.PublicKey(key),
+		logger:     logger,
+		now:        time.Now,
+		privateKey: privateKey,
+		executor:   commandWireGuardExecutor{},
+		platform:   runtime.GOOS,
 	}, nil
 }
 
@@ -85,6 +109,11 @@ func parseBaseURL(raw string) (*url.URL, error) {
 }
 
 func (a *agent) run(ctx context.Context) error {
+	if a.config.Apply {
+		if err := a.recoverApply(ctx); err != nil {
+			return a.fail(a.config.NodeID, 0, "", err)
+		}
+	}
 	var snapshot nodeprotocol.Snapshot
 	if err := a.getJSON(ctx, "/v1/node/config", &snapshot); err != nil {
 		return a.fail(a.config.NodeID, 0, "", err)
@@ -96,6 +125,13 @@ func (a *agent) run(ctx context.Context) error {
 		return a.fail(snapshot.NodeID, snapshot.Version, nodeprotocol.SnapshotDigest(snapshot), apiError{category: "snapshot_invalid"})
 	}
 	digest := nodeprotocol.SnapshotDigest(snapshot)
+	if state, err := a.readAppliedState(); err == nil && state.NodeID == snapshot.NodeID &&
+		state.Version == snapshot.Version && state.Digest == digest {
+		a.log(snapshot.NodeID, snapshot.Version, digest, "already_applied")
+		return nil
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return a.fail(snapshot.NodeID, snapshot.Version, digest, apiError{category: "local_state_unavailable"})
+	}
 
 	var approvalResponse struct {
 		Approval nodeprotocol.Approval `json:"approval"`
@@ -114,27 +150,26 @@ func (a *agent) run(ctx context.Context) error {
 	if err := a.rejectLocalReplay(approval.Nonce); err != nil {
 		return a.fail(snapshot.NodeID, snapshot.Version, digest, err)
 	}
-
-	requestBody, err := json.Marshal(map[string]nodeprotocol.Approval{"approval": approval})
+	candidate, err := renderWireGuardConfig(snapshot, a.privateKey)
 	if err != nil {
-		return a.fail(snapshot.NodeID, snapshot.Version, digest, apiError{category: "request_encode_failed"})
-	}
-	var result struct {
-		Verified         bool  `json:"verified"`
-		NodeID           int64 `json:"node_id"`
-		CandidateVersion int64 `json:"candidate_version"`
-		Applied          bool  `json:"applied"`
-	}
-	if err := a.requestJSON(ctx, http.MethodPost, "/v1/node/config/approval/verify", bytes.NewReader(requestBody), &result); err != nil {
 		return a.fail(snapshot.NodeID, snapshot.Version, digest, err)
 	}
-	if !result.Verified || result.Applied || result.NodeID != snapshot.NodeID || result.CandidateVersion != snapshot.Version {
-		return a.fail(snapshot.NodeID, snapshot.Version, digest, apiError{category: "verification_response_mismatch"})
+	previous, err := readManagedConfig(a.config.ConfigFile)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return a.fail(snapshot.NodeID, snapshot.Version, digest, apiError{category: "current_config_invalid"})
 	}
-	if err := a.persistConsumedNonce(approval.Nonce, approval.ExpiresAt); err != nil {
-		return a.fail(snapshot.NodeID, snapshot.Version, digest, apiError{category: "nonce_state_write_failed"})
+	diff, err := compareWireGuardConfigs(previous, candidate)
+	if err != nil {
+		return a.fail(snapshot.NodeID, snapshot.Version, digest, apiError{category: "current_config_invalid"})
 	}
-	a.log(snapshot.NodeID, snapshot.Version, digest, "approval_verified_read_only")
+	if !a.config.Apply {
+		a.logDiff(snapshot.NodeID, snapshot.Version, digest, diff, "dry_run_valid")
+		return nil
+	}
+	if err := a.applyApproved(ctx, snapshot, approval, digest, candidate); err != nil {
+		return a.fail(snapshot.NodeID, snapshot.Version, digest, err)
+	}
+	a.logDiff(snapshot.NodeID, snapshot.Version, digest, diff, "configuration_applied")
 	return nil
 }
 

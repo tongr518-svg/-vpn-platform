@@ -1,6 +1,6 @@
 # VPN Platform 本地开发指南
 
-本项目包含 PostgreSQL、Go 控制面 API、嵌入式 Web 管理后台和 Flutter 客户端源码。当前版本包含节点元数据、设备分配、快照 dry-run 和候选审批控制面；**不应用 WireGuard 配置、不建立 VPN 隧道、不转发用户流量，也不接入支付**。
+本项目包含 PostgreSQL、Go 控制面 API、嵌入式 Web 管理后台和 Flutter 客户端源码。节点 Agent 默认只执行快照与审批验证的 dry-run；显式 `--apply` 时仅可将批准配置应用到隔离测试接口 `wg-lab`，不设置路由、NAT 或防火墙，不承载真实用户流量。客户端隧道和支付尚未实现。
 
 ## Flutter 客户端演示
 

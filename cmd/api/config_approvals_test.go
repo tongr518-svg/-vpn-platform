@@ -150,8 +150,13 @@ func TestNodeConfigApprovalSignatureLifecycle(t *testing.T) {
 		t.Fatalf("篡改版本的审批应拒绝，得到 %d：%s", bad.Code, bad.Body.String())
 	}
 
+	beforeApply := testRequest(t, handler, http.MethodPost, "/v1/node/config/approval/verify", credential,
+		map[string]any{"approval": packageResponse.Approval, "applied": false})
+	if beforeApply.Code != http.StatusConflict {
+		t.Fatalf("未应用配置时不得消费审批，得到 %d：%s", beforeApply.Code, beforeApply.Body.String())
+	}
 	verified := testRequest(t, handler, http.MethodPost, "/v1/node/config/approval/verify", credential,
-		map[string]any{"approval": packageResponse.Approval})
+		map[string]any{"approval": packageResponse.Approval, "applied": true})
 	if verified.Code != http.StatusOK || !json.Valid(verified.Body.Bytes()) {
 		t.Fatalf("有效审批验证失败：%d %s", verified.Code, verified.Body.String())
 	}
@@ -159,13 +164,13 @@ func TestNodeConfigApprovalSignatureLifecycle(t *testing.T) {
 		Verified bool `json:"verified"`
 		Applied  bool `json:"applied"`
 	}
-	if err := json.Unmarshal(verified.Body.Bytes(), &verification); err != nil || !verification.Verified || verification.Applied {
-		t.Fatalf("审批验证结果错误或发生应用：%s (%v)", verified.Body.String(), err)
+	if err := json.Unmarshal(verified.Body.Bytes(), &verification); err != nil || !verification.Verified || !verification.Applied {
+		t.Fatalf("应用确认结果错误：%s (%v)", verified.Body.String(), err)
 	}
 	replayed := testRequest(t, handler, http.MethodPost, "/v1/node/config/approval/verify", credential,
-		map[string]any{"approval": packageResponse.Approval})
-	if replayed.Code != http.StatusConflict || !json.Valid(replayed.Body.Bytes()) {
-		t.Fatalf("重复提交审批包应拒绝重放，得到 %d：%s", replayed.Code, replayed.Body.String())
+		map[string]any{"approval": packageResponse.Approval, "applied": true})
+	if replayed.Code != http.StatusOK || !json.Valid(replayed.Body.Bytes()) {
+		t.Fatalf("已应用审批的重复确认应幂等，得到 %d：%s", replayed.Code, replayed.Body.String())
 	}
 
 	adminAudit := testRequest(t, handler, http.MethodGet, "/v1/admin/audit-logs", adminToken, nil)
@@ -201,7 +206,7 @@ func TestNodeConfigApprovalRejectsExpiredSignedPackage(t *testing.T) {
 		t.Fatalf("构造过期签名审批失败: %v", err)
 	}
 	response := testRequest(t, handler, http.MethodPost, "/v1/node/config/approval/verify", credential,
-		map[string]any{"approval": result.Approval})
+		map[string]any{"approval": result.Approval, "applied": true})
 	if response.Code != http.StatusConflict || !bytes.Contains(response.Body.Bytes(), []byte("approval_expired")) {
 		t.Fatalf("过期但签名正确的审批应被拒绝，得到 %d：%s", response.Code, response.Body.String())
 	}
@@ -236,7 +241,7 @@ func TestConfigApprovalInvalidatedWhenCandidateSnapshotChanges(t *testing.T) {
 		t.Fatalf("候选版本变化后旧审批不应再提供，得到 %d：%s", current.Code, current.Body.String())
 	}
 	verify := testRequest(t, handler, http.MethodPost, "/v1/node/config/approval/verify", credential,
-		map[string]any{"approval": packageResponse.Approval})
+		map[string]any{"approval": packageResponse.Approval, "applied": true})
 	if verify.Code != http.StatusConflict || !json.Valid(verify.Body.Bytes()) {
 		t.Fatalf("旧候选审批验证应返回冲突，得到 %d：%s", verify.Code, verify.Body.String())
 	}

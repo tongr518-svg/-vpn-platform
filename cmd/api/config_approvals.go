@@ -24,6 +24,7 @@ type nodeConfigApproval = nodeprotocol.Approval
 
 type verifyNodeApprovalRequest struct {
 	Approval nodeConfigApproval `json:"approval"`
+	Applied  bool               `json:"applied"`
 }
 
 type configSigningKeyResponse struct {
@@ -308,6 +309,10 @@ func (a *API) nodeVerifyConfigApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	approval := in.Approval
+	if !in.Applied {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "configuration_not_applied"})
+		return
+	}
 	if approval.ID <= 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_approval_id"})
 		return
@@ -331,6 +336,11 @@ func (a *API) nodeVerifyConfigApproval(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "approval_node_mismatch"})
 		return
 	}
+	var lockedNodeID int64
+	if err := tx.QueryRow(r.Context(), `SELECT id FROM nodes WHERE id = $1 FOR UPDATE`, nodeID).Scan(&lockedNodeID); err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
 	signature, err := base64.StdEncoding.DecodeString(approval.Signature)
 	if err != nil || len(signature) != ed25519.SignatureSize ||
 		!ed25519.Verify(a.configSigningKey.Public().(ed25519.PublicKey), approvalMessage(approval), signature) {
@@ -339,13 +349,13 @@ func (a *API) nodeVerifyConfigApproval(w http.ResponseWriter, r *http.Request) {
 	}
 	var stored nodeConfigApproval
 	var storedSignature []byte
-	var consumed bool
+	var consumed, applied bool
 	err = tx.QueryRow(r.Context(),
 		`SELECT id, node_id, candidate_version, candidate_digest, nonce, signature, approved_at, expires_at,
-	                consumed_at IS NOT NULL
+	                consumed_at IS NOT NULL, applied_at IS NOT NULL
 		 FROM node_config_approvals WHERE id = $1 FOR UPDATE`, approval.ID,
 	).Scan(&stored.ID, &stored.NodeID, &stored.CandidateVersion, &stored.CandidateDigest, &stored.Nonce,
-		&storedSignature, &stored.IssuedAt, &stored.ExpiresAt, &consumed)
+		&storedSignature, &stored.IssuedAt, &stored.ExpiresAt, &consumed, &applied)
 	if err == pgx.ErrNoRows {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "approval_not_found"})
 		return
@@ -354,15 +364,26 @@ func (a *API) nodeVerifyConfigApproval(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
-	if consumed {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "approval_replayed"})
-		return
-	}
 	if stored.NodeID != approval.NodeID || stored.CandidateVersion != approval.CandidateVersion ||
 		stored.CandidateDigest != approval.CandidateDigest || stored.Nonce != approval.Nonce ||
 		!stored.IssuedAt.Equal(approval.IssuedAt) || !stored.ExpiresAt.Equal(approval.ExpiresAt) ||
 		!ed25519.Verify(a.configSigningKey.Public().(ed25519.PublicKey), approvalMessage(stored), storedSignature) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "approval_payload_mismatch"})
+		return
+	}
+	if consumed {
+		if !applied {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "approval_consumed_without_apply_record"})
+			return
+		}
+		if err := tx.Commit(r.Context()); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, map[string]any{
+			"verified": true, "node_id": nodeID, "candidate_version": stored.CandidateVersion, "applied": true,
+		})
 		return
 	}
 	if !stored.ExpiresAt.After(time.Now()) {
@@ -374,7 +395,8 @@ func (a *API) nodeVerifyConfigApproval(w http.ResponseWriter, r *http.Request) {
 	err = tx.QueryRow(r.Context(),
 		`SELECT n.desired_config_version, d.candidate_digest
 		 FROM nodes n JOIN node_config_dry_runs d ON d.node_id = n.id
-		 WHERE n.id = $1 AND d.status = 'valid'`, nodeID,
+		 WHERE n.id = $1 AND d.status = 'valid'
+		 FOR UPDATE OF n, d`, nodeID,
 	).Scan(&desiredVersion, &storedDigest)
 	if err == pgx.ErrNoRows {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "approval_candidate_stale"})
@@ -398,7 +420,11 @@ func (a *API) nodeVerifyConfigApproval(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "approval_candidate_stale"})
 		return
 	}
-	if _, err := tx.Exec(r.Context(), `UPDATE node_config_approvals SET consumed_at = NOW() WHERE id = $1`, approval.ID); err != nil {
+	if _, err := tx.Exec(r.Context(),
+		`UPDATE node_config_approvals
+		 SET consumed_at = NOW(), applied_at = NOW()
+		 WHERE id = $1 AND consumed_at IS NULL`, approval.ID,
+	); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
@@ -408,7 +434,7 @@ func (a *API) nodeVerifyConfigApproval(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{
-		"verified": true, "node_id": nodeID, "candidate_version": stored.CandidateVersion, "applied": false,
+		"verified": true, "node_id": nodeID, "candidate_version": stored.CandidateVersion, "applied": true,
 	})
 }
 
