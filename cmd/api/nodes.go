@@ -198,7 +198,7 @@ func (a *API) adminListNodes(w http.ResponseWriter, r *http.Request) {
 	rows, err := a.db.Query(r.Context(),
 		`SELECT `+nodeSelectColumns+`
 		 FROM nodes
-		 ORDER BY created_at DESC, id DESC
+		 ORDER BY nodes.created_at DESC, nodes.id DESC
 		 LIMIT 500`,
 	)
 	if err != nil {
