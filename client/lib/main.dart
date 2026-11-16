@@ -19,7 +19,8 @@ Uri parseApiBaseUrl(String raw) {
   }
 
   final host = uri.host.toLowerCase();
-  final isLocalHost = host == 'localhost' ||
+  final isLocalHost =
+      host == 'localhost' ||
       host == '127.0.0.1' ||
       host == '::1' ||
       host == '10.0.2.2';
@@ -155,10 +156,8 @@ class _ClientHomeState extends State<ClientHome> {
     if (mounted) setState(() => _token = token);
   }
 
-  String get _baseUrl => _baseUrlController.text.trim().replaceAll(
-        RegExp(r'/+$'),
-        '',
-      );
+  String get _baseUrl =>
+      _baseUrlController.text.trim().replaceAll(RegExp(r'/+$'), '');
 
   String _currentPlatform() {
     switch (defaultTargetPlatform) {
@@ -289,11 +288,7 @@ class _ClientHomeState extends State<ClientHome> {
       final result = await _request(
         '/v1/auth/register',
         method: 'POST',
-        body: {
-          'email': email,
-          'password': password,
-          'invite_code': inviteCode,
-        },
+        body: {'email': email, 'password': password, 'invite_code': inviteCode},
       );
       if (result is! Map<String, dynamic>) {
         throw Exception('注册响应格式无效');
@@ -310,9 +305,11 @@ class _ClientHomeState extends State<ClientHome> {
       if (mounted) setState(() => _message = '注册成功');
     } catch (error) {
       if (mounted) {
-        setState(() => _message = registeredOnServer
-            ? '账号已注册，但无法保存登录状态；请使用刚注册的账号登录。${_errorText(error)}'
-            : _errorText(error));
+        setState(
+          () => _message = registeredOnServer
+              ? '账号已注册，但无法保存登录状态；请使用刚注册的账号登录。${_errorText(error)}'
+              : _errorText(error),
+        );
       }
     } finally {
       if (mounted) setState(() => _busy = false);
@@ -432,9 +429,11 @@ class _ClientHomeState extends State<ClientHome> {
       }
       await _loadAccount();
       if (mounted && _token != null) {
-        setState(() => _message = cleanupError == null
-            ? '设备已撤销'
-            : '设备已撤销，但本地密钥清理失败：$cleanupError');
+        setState(
+          () => _message = cleanupError == null
+              ? '设备已撤销'
+              : '设备已撤销，但本地密钥清理失败：$cleanupError',
+        );
       }
     } catch (error) {
       if (mounted) setState(() => _message = _errorText(error));
@@ -517,8 +516,7 @@ class _ClientHomeState extends State<ClientHome> {
             child: const Text('取消'),
           ),
           FilledButton(
-            onPressed: () =>
-                Navigator.pop(context, nameController.text.trim()),
+            onPressed: () => Navigator.pop(context, nameController.text.trim()),
             child: const Text('继续'),
           ),
         ],
@@ -821,9 +819,7 @@ class _ClientHomeState extends State<ClientHome> {
   @override
   Widget build(BuildContext context) {
     if (!_sessionReady) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator()),
-      );
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
     return Scaffold(
@@ -906,9 +902,8 @@ class _ClientHomeState extends State<ClientHome> {
               decoration: const InputDecoration(labelText: '密码'),
               obscureText: true,
               autofillHints: const [AutofillHints.password],
-              onSubmitted: (_) => _busy
-                  ? null
-                  : (_isRegistering ? _register() : _login()),
+              onSubmitted: (_) =>
+                  _busy ? null : (_isRegistering ? _register() : _login()),
             ),
             if (_isRegistering) ...[
               const SizedBox(height: 8),
@@ -921,12 +916,8 @@ class _ClientHomeState extends State<ClientHome> {
             ],
             const SizedBox(height: 16),
             FilledButton(
-              onPressed: _busy
-                  ? null
-                  : (_isRegistering ? _register : _login),
-              child: Text(
-                _busy ? '请稍候…' : (_isRegistering ? '注册并登录' : '登录'),
-              ),
+              onPressed: _busy ? null : (_isRegistering ? _register : _login),
+              child: Text(_busy ? '请稍候…' : (_isRegistering ? '注册并登录' : '登录')),
             ),
             TextButton(
               onPressed: _busy
@@ -937,9 +928,7 @@ class _ClientHomeState extends State<ClientHome> {
                         _message = null;
                       });
                     },
-              child: Text(
-                _isRegistering ? '已有账号？返回登录' : '没有账号？使用邀请口令注册',
-              ),
+              child: Text(_isRegistering ? '已有账号？返回登录' : '没有账号？使用邀请口令注册'),
             ),
           ],
         ),
@@ -1039,8 +1028,10 @@ class _ClientHomeState extends State<ClientHome> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('当前套餐：${subscription['plan_name'] ?? '—'}',
-            style: Theme.of(context).textTheme.titleLarge),
+        Text(
+          '当前套餐：${subscription['plan_name'] ?? '—'}',
+          style: Theme.of(context).textTheme.titleLarge,
+        ),
         const SizedBox(height: 6),
         Text('设备数上限：${subscription['device_limit'] ?? '—'}'),
         Text('并发数上限：${subscription['concurrent_limit'] ?? '—'}'),
@@ -1098,10 +1089,7 @@ class _ClientHomeState extends State<ClientHome> {
             );
           }),
         const SizedBox(height: 4),
-        const Text(
-          '最多显示最近 100 条记录。',
-          style: TextStyle(color: Colors.grey),
-        ),
+        const Text('最多显示最近 100 条记录。', style: TextStyle(color: Colors.grey)),
       ],
     );
   }
