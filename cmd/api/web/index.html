@@ -135,6 +135,24 @@
 
     <section>
       <div class="row">
+        <h2 style="flex:1">节点</h2>
+        <button id="refreshNodes" type="button">刷新</button>
+      </div>
+      <form id="nodeForm" class="row">
+        <input id="nodeName" placeholder="节点名称" maxlength="100" required>
+        <input id="nodeRegion" placeholder="区域" maxlength="80" required>
+        <input id="nodeCapacity" type="number" min="1" value="100" title="容量" required>
+        <button class="primary">新增节点</button>
+      </form>
+      <p class="muted">节点凭据仅在创建或轮换时显示一次。心跳只更新控制面状态；此版本不配置隧道或转发流量。</p>
+      <table>
+        <thead><tr><th>ID</th><th>名称</th><th>区域</th><th>状态</th><th>容量</th><th>最近心跳</th><th>凭据</th><th>操作</th></tr></thead>
+        <tbody id="nodesBody"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <div class="row">
         <h2 style="flex:1">操作审计记录</h2>
         <button id="refreshAuditLogs" type="button">刷新</button>
       </div>
@@ -409,9 +427,92 @@
     }
   }
 
+  async function loadNodes() {
+    const nodes = await api("/v1/admin/nodes");
+    const body = $("nodesBody");
+    body.replaceChildren();
+    for (const node of nodes) {
+      const tr = document.createElement("tr");
+      cell(tr, node.id);
+      cell(tr, node.name);
+      cell(tr, node.region);
+      cell(tr, { active: "运行", maintenance: "维护", disabled: "停用" }[node.status] || node.status);
+      cell(tr, node.capacity);
+      cell(tr, dateText(node.last_heartbeat_at) || "尚无心跳");
+      cell(tr, node.credential_active ? "有效" : "已撤销");
+
+      const td = document.createElement("td");
+      const status = document.createElement("select");
+      for (const [value, label] of [["active", "运行"], ["maintenance", "维护"], ["disabled", "停用"]]) {
+        status.add(new Option(label, value, false, node.status === value));
+      }
+      status.addEventListener("change", async () => {
+        try {
+          await api(`/v1/admin/nodes/${node.id}/status`, {
+            method: "PATCH", body: JSON.stringify({ status: status.value })
+          });
+          message(`节点 ${node.id} 状态已更新`);
+          await loadNodes();
+        } catch (error) { handleAuthError(error); }
+      });
+      td.appendChild(status);
+
+      const edit = document.createElement("button");
+      edit.textContent = "编辑元数据";
+      edit.addEventListener("click", async () => {
+        const name = window.prompt("节点名称", node.name);
+        if (name === null) return;
+        const region = window.prompt("区域", node.region);
+        if (region === null) return;
+        const capacityText = window.prompt("容量", String(node.capacity));
+        if (capacityText === null) return;
+        const capacity = Number(capacityText);
+        try {
+          await api(`/v1/admin/nodes/${node.id}`, {
+            method: "PATCH", body: JSON.stringify({ name, region, capacity })
+          });
+          message(`节点 ${node.id} 元数据已更新`);
+          await loadNodes();
+        } catch (error) { handleAuthError(error); }
+      });
+      td.appendChild(edit);
+
+      const rotate = document.createElement("button");
+      rotate.textContent = "轮换凭据";
+      rotate.addEventListener("click", async () => {
+        if (!confirm(`轮换节点 ${node.id} 的凭据？旧凭据将立即失效。`)) return;
+        try {
+          const result = await api(`/v1/admin/nodes/${node.id}/credentials/rotate`, { method: "POST" });
+          window.prompt("凭据只显示这一次，请立即复制并安全保存：", result.credential);
+          message("节点凭据已轮换；旧凭据已失效");
+          await loadNodes();
+        } catch (error) { handleAuthError(error); }
+      });
+      td.appendChild(rotate);
+
+      if (node.credential_active) {
+        const revoke = document.createElement("button");
+        revoke.textContent = "撤销凭据";
+        revoke.className = "danger";
+        revoke.addEventListener("click", async () => {
+          if (!confirm(`确定撤销节点 ${node.id} 的凭据吗？`)) return;
+          try {
+            await api(`/v1/admin/nodes/${node.id}/credentials`, { method: "DELETE" });
+            message("节点凭据已撤销");
+            await loadNodes();
+          } catch (error) { handleAuthError(error); }
+        });
+        td.appendChild(revoke);
+      }
+
+      tr.appendChild(td);
+      body.appendChild(tr);
+    }
+  }
+
   async function refresh() {
     try {
-      await Promise.all([loadUsers(), loadPlans(), loadInvites(), loadSubscriptions(), loadAuditLogs()]);
+      await Promise.all([loadUsers(), loadPlans(), loadInvites(), loadSubscriptions(), loadNodes(), loadAuditLogs()]);
       message("数据已刷新");
     } catch (error) { handleAuthError(error); }
   }
@@ -459,6 +560,25 @@
     "click",
     () => loadAuditLogs().catch(handleAuthError)
   );
+  $("refreshNodes").addEventListener("click", () => loadNodes().catch(handleAuthError));
+
+  $("nodeForm").addEventListener("submit", async event => {
+    event.preventDefault();
+    try {
+      const result = await api("/v1/admin/nodes", {
+        method: "POST",
+        body: JSON.stringify({
+          name: $("nodeName").value.trim(),
+          region: $("nodeRegion").value.trim(),
+          capacity: Number($("nodeCapacity").value)
+        })
+      });
+      $("nodeForm").reset();
+      window.prompt("节点凭据只显示这一次，请立即复制并安全保存：", result.credential);
+      message(`节点已创建（ID ${result.node.id}）；凭据只显示一次`);
+      await loadNodes();
+    } catch (error) { handleAuthError(error); }
+  });
 
   $("planForm").addEventListener("submit", async event => {
     event.preventDefault();

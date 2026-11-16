@@ -82,6 +82,13 @@ JWT 有效期为 12 小时。账号暂停或 `token_version` 变化后，旧 JWT
 | `DELETE` | `/v1/admin/invites/{id}` | 撤销邀请码并写入审计 |
 | `GET` | `/v1/admin/users/{id}/devices` | 查看用户设备，不返回公钥 |
 | `DELETE` | `/v1/admin/users/{id}/devices/{deviceID}` | 管理员撤销用户设备 |
+| `GET` | `/v1/admin/nodes` | 查询节点元数据、状态与最近心跳，不返回凭据 |
+| `POST` | `/v1/admin/nodes` | 新增节点；节点凭据仅在响应中显示一次 |
+| `PATCH` | `/v1/admin/nodes/{id}` | 更新节点名称、区域或容量 |
+| `PATCH` | `/v1/admin/nodes/{id}/status` | 设置 `active`、`maintenance` 或 `disabled` |
+| `POST` | `/v1/admin/nodes/{id}/credentials/rotate` | 轮换节点凭据，旧凭据立即失效，新凭据只返回一次 |
+| `DELETE` | `/v1/admin/nodes/{id}/credentials` | 撤销节点凭据 |
+| `POST` | `/v1/node/heartbeat` | 节点使用专属 Bearer 凭据上报健康状态 |
 
 用户状态请求体为 `{"status":"active"}` 或 `{"status":"suspended"}`；套餐启停请求体为 `{"active":true}` 或 `{"active":false}`。创建套餐字段为 `name`、`device_limit`、`concurrent_limit`、`data_limit_bytes`、`speed_limit_mbps`；流量和速度限制设为 `0` 表示不限。订阅开通字段为 `plan_id`、`starts_at`、`ends_at`，时间使用 RFC 3339 格式。
 
@@ -90,6 +97,8 @@ JWT 有效期为 12 小时。账号暂停或 `token_version` 变化后，旧 JWT
 订阅列表会把数据库状态为 `active`、但 `ends_at` 已过期的记录显示为 `expired`，不会自动改写数据库状态。取消接口仅匹配 `status = 'active'` 且 `ends_at > NOW()` 的记录；不符合条件时返回 `409 subscription_not_active`。套餐的流量和速度限制目前只保存和展示，尚未通过节点执行。
 
 操作审计记录包括管理员后台操作、用户修改密码，以及用户设备注册、重命名和撤销。设备操作记录操作者、动作和设备 ID，不记录设备公钥、密码或 JWT。
+
+节点凭据由安全随机数生成，数据库只保存 SHA-256 哈希；创建和轮换响应会一次性返回明文凭据，列表和后续读取都不会再次返回。心跳只更新 `last_heartbeat_at`，`maintenance` 节点仍可上报，`disabled` 节点的心跳会被拒绝；撤销或轮换凭据会立即使旧凭据失效。节点状态和健康心跳目前只用于控制面运维，不建立 VPN 隧道或转发用户流量。
 
 邀请码原码由安全随机数生成，数据库只保存 SHA-256 哈希。管理员创建后需立即复制保存，之后列表只显示额度、状态和过期时间。注册会锁定邀请码并在同一事务中创建用户、增加使用次数；邮箱冲突或其他失败会回滚，不消耗额度。邀请码状态为 `active`、`exhausted`、`expired` 或 `revoked`。首位管理员创建正式邀请码后，旧 `INVITE_CODE` 不再接受；旧口令仅在数据库还没有任何管理员时兼容。
 

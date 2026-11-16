@@ -282,6 +282,138 @@ func TestExistingSubscriptionWorksAfterPlanIsDeactivated(t *testing.T) {
 	}
 }
 
+func TestNodeAdministrationAndCredentialLifecycle(t *testing.T) {
+	api, userID, cleanup := testFixture(t)
+	defer cleanup()
+	handler := testRouter(api)
+	userToken := testToken(t, api, userID)
+
+	denied := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", userToken,
+		map[string]any{"name": "edge-a", "region": "test", "capacity": 100})
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("普通用户创建节点应返回 403，得到 %d：%s", denied.Code, denied.Body.String())
+	}
+
+	if _, err := api.db.Exec(context.Background(), `UPDATE users SET role = 'admin' WHERE id = $1`, userID); err != nil {
+		t.Fatalf("设置测试管理员失败: %v", err)
+	}
+	adminToken := testToken(t, api, userID)
+	created := testRequest(t, handler, http.MethodPost, "/v1/admin/nodes", adminToken,
+		map[string]any{"name": "edge-a", "region": "test-region", "capacity": 100})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("管理员创建节点应返回 201，得到 %d：%s", created.Code, created.Body.String())
+	}
+	var createdBody struct {
+		Node struct {
+			ID int64 `json:"id"`
+		} `json:"node"`
+		Credential string `json:"credential"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &createdBody); err != nil {
+		t.Fatalf("解析节点创建响应失败: %v", err)
+	}
+	if createdBody.Node.ID <= 0 || createdBody.Credential == "" {
+		t.Fatalf("节点响应缺少 ID 或一次性凭据: %s", created.Body.String())
+	}
+	nodeID := createdBody.Node.ID
+	firstCredential := createdBody.Credential
+
+	var storedHash []byte
+	if err := api.db.QueryRow(context.Background(), `SELECT token_hash FROM node_credentials WHERE node_id = $1`, nodeID).Scan(&storedHash); err != nil {
+		t.Fatalf("查询节点凭据哈希失败: %v", err)
+	}
+	expectedHash := sha256.Sum256([]byte(firstCredential))
+	if !bytes.Equal(storedHash, expectedHash[:]) {
+		t.Fatal("数据库未保存节点凭据的 SHA-256 哈希")
+	}
+	if bytes.Contains(storedHash, []byte(firstCredential)) {
+		t.Fatal("数据库不应保存节点明文凭据")
+	}
+
+	heartbeat := func(credential string) *httptest.ResponseRecorder {
+		return testRequest(t, handler, http.MethodPost, "/v1/node/heartbeat", credential, nil)
+	}
+	if response := heartbeat(firstCredential); response.Code != http.StatusNoContent {
+		t.Fatalf("有效节点凭据心跳应返回 204，得到 %d：%s", response.Code, response.Body.String())
+	}
+
+	maintenance := testRequest(t, handler, http.MethodPatch, fmt.Sprintf("/v1/admin/nodes/%d/status", nodeID), adminToken,
+		map[string]string{"status": "maintenance"})
+	if maintenance.Code != http.StatusOK {
+		t.Fatalf("节点进入维护状态应返回 200，得到 %d：%s", maintenance.Code, maintenance.Body.String())
+	}
+	if response := heartbeat(firstCredential); response.Code != http.StatusNoContent {
+		t.Fatalf("维护状态仍应接受健康心跳，得到 %d：%s", response.Code, response.Body.String())
+	}
+
+	rotated := testRequest(t, handler, http.MethodPost,
+		fmt.Sprintf("/v1/admin/nodes/%d/credentials/rotate", nodeID), adminToken, nil)
+	if rotated.Code != http.StatusCreated {
+		t.Fatalf("凭据轮换应返回 201，得到 %d：%s", rotated.Code, rotated.Body.String())
+	}
+	var rotatedBody map[string]string
+	if err := json.Unmarshal(rotated.Body.Bytes(), &rotatedBody); err != nil {
+		t.Fatalf("解析轮换响应失败: %v", err)
+	}
+	newCredential := rotatedBody["credential"]
+	if newCredential == "" || newCredential == firstCredential {
+		t.Fatal("轮换后应返回新的凭据")
+	}
+	if response := heartbeat(firstCredential); response.Code != http.StatusUnauthorized {
+		t.Fatalf("旧凭据轮换后应返回 401，得到 %d", response.Code)
+	}
+	if response := heartbeat(newCredential); response.Code != http.StatusNoContent {
+		t.Fatalf("新凭据心跳应返回 204，得到 %d：%s", response.Code, response.Body.String())
+	}
+
+	disabled := testRequest(t, handler, http.MethodPatch, fmt.Sprintf("/v1/admin/nodes/%d/status", nodeID), adminToken,
+		map[string]string{"status": "disabled"})
+	if disabled.Code != http.StatusOK {
+		t.Fatalf("停用节点应返回 200，得到 %d：%s", disabled.Code, disabled.Body.String())
+	}
+	if response := heartbeat(newCredential); response.Code != http.StatusUnauthorized {
+		t.Fatalf("停用节点心跳应返回 401，得到 %d", response.Code)
+	}
+
+	updated := testRequest(t, handler, http.MethodPatch, fmt.Sprintf("/v1/admin/nodes/%d", nodeID), adminToken,
+		map[string]any{"name": "edge-renamed", "region": "region-2", "capacity": 120})
+	if updated.Code != http.StatusOK {
+		t.Fatalf("更新节点元数据应返回 200，得到 %d：%s", updated.Code, updated.Body.String())
+	}
+
+	revoked := testRequest(t, handler, http.MethodDelete,
+		fmt.Sprintf("/v1/admin/nodes/%d/credentials", nodeID), adminToken, nil)
+	if revoked.Code != http.StatusNoContent {
+		t.Fatalf("撤销节点凭据应返回 204，得到 %d：%s", revoked.Code, revoked.Body.String())
+	}
+	activeAgain := testRequest(t, handler, http.MethodPatch, fmt.Sprintf("/v1/admin/nodes/%d/status", nodeID), adminToken,
+		map[string]string{"status": "active"})
+	if activeAgain.Code != http.StatusOK {
+		t.Fatalf("重新启用节点应返回 200，得到 %d：%s", activeAgain.Code, activeAgain.Body.String())
+	}
+	if response := heartbeat(newCredential); response.Code != http.StatusUnauthorized {
+		t.Fatalf("撤销凭据后心跳应返回 401，得到 %d", response.Code)
+	}
+
+	list := testRequest(t, handler, http.MethodGet, "/v1/admin/nodes", adminToken, nil)
+	if list.Code != http.StatusOK {
+		t.Fatalf("管理员查看节点应返回 200，得到 %d：%s", list.Code, list.Body.String())
+	}
+	if bytes.Contains(list.Body.Bytes(), []byte(firstCredential)) || bytes.Contains(list.Body.Bytes(), []byte(newCredential)) {
+		t.Fatal("节点列表不应返回任何明文凭据")
+	}
+
+	var auditCount int
+	if err := api.db.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM admin_audit_logs WHERE actor_user_id = $1 AND target_type = 'node'`, userID,
+	).Scan(&auditCount); err != nil {
+		t.Fatalf("查询节点审计记录失败: %v", err)
+	}
+	if auditCount < 5 {
+		t.Fatalf("节点创建、元数据/状态变更和凭据操作均应审计，记录数仅 %d", auditCount)
+	}
+}
+
 func TestListMySubscriptionsShowsHistoryAndOnlyOwnRecords(t *testing.T) {
 	api, userID, cleanup := testFixture(t)
 	defer cleanup()
