@@ -625,7 +625,9 @@ class _ClientHomeState extends State<ClientHome> {
         if (existingDevice is Map && existingDevice['revoked_at'] != null) {
           await _secureStorage.delete(key: 'wg_private_$publicKey');
         } else {
-          final privateKey = await _secureStorage.read(key: 'wg_private_$publicKey');
+          final privateKey = await _secureStorage.read(
+            key: 'wg_private_$publicKey',
+          );
           if (privateKey == null || privateKey.isEmpty) {
             throw Exception('待重试设备的本地私钥不存在，无法安全重试');
           }
@@ -1005,8 +1007,12 @@ class _ClientHomeState extends State<ClientHome> {
                 ),
                 const SizedBox(height: 8),
                 if (_devicesMessage != null)
-                  Text(_devicesMessage!,
-                      style: TextStyle(color: Theme.of(context).colorScheme.error))
+                  Text(
+                    _devicesMessage!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  )
                 else if (_devices.isEmpty)
                   const Text('暂无设备。')
                 else
