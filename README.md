@@ -2,6 +2,21 @@
 
 本项目包含 PostgreSQL、Go 控制面 API、嵌入式 Web 管理后台和 Flutter 客户端源码。当前版本包含节点元数据、设备分配、快照 dry-run 和候选审批控制面；**不应用 WireGuard 配置、不建立 VPN 隧道、不转发用户流量，也不接入支付**。
 
+## Flutter 客户端演示
+
+`client` 启动页提供“进入演示模式”。它使用应用内存中的虚构账号、订阅、设备和节点数据，不登录、不调用 API、不读写安全存储；演示页面显示“演示模式 · 虚构数据”，连接保持禁用，设备和账号修改入口隐藏。退出演示模式会回到登录页。仓库根目录的 `打开界面预览.bat` 仍可打开独立静态网页预览 `preview/index.html`，无需 Flutter 或 API。
+
+安装 Flutter SDK 后，可在 Windows 上运行桌面客户端：
+
+```powershell
+cd D:\vpn-platform\client
+flutter create --platforms=windows --project-name vpn_platform_client .
+flutter pub get
+flutter run -d windows
+```
+
+CI 的 `Windows desktop build` 任务会构建 Release 版本，并将 `vpn-client-windows` 作为 Actions artifact 保存 7 天。下载后需要保留整个 Release 目录，再运行 `vpn_platform_client.exe`。
+
 API 和 PostgreSQL 端口只绑定到 `127.0.0.1`。这是本地开发配置，不要直接暴露到公网。
 
 ## 环境配置

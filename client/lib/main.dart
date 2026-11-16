@@ -6,6 +6,8 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:material_ui/material_ui.dart';
 
+import 'demo_data.dart';
+
 Uri parseApiBaseUrl(String raw) {
   final uri = Uri.tryParse(raw.trim());
   if (uri == null ||
@@ -82,6 +84,7 @@ class _ClientHomeState extends State<ClientHome> {
   bool _busy = false;
   bool _isRegistering = false;
   bool _sessionReady = false;
+  bool _demoMode = false;
 
   @override
   void initState() {
@@ -178,6 +181,9 @@ class _ClientHomeState extends State<ClientHome> {
     String method = 'GET',
     Map<String, dynamic>? body,
   }) async {
+    if (_demoMode) {
+      throw StateError('演示模式已禁用 API 请求');
+    }
     final baseUri = parseApiBaseUrl(_baseUrl);
     final uri = baseUri.resolve(path);
     final headers = <String, String>{
@@ -313,6 +319,38 @@ class _ClientHomeState extends State<ClientHome> {
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  void _startDemoMode() {
+    final demo = buildDemoData(DateTime.now());
+
+    setState(() {
+      _demoMode = true;
+      _token = null;
+      _user = demo.user;
+      _subscription = demo.subscription;
+      _subscriptionHistory = demo.subscriptionHistory;
+      _devices = demo.devices;
+      _subscriptionMessage = null;
+      _subscriptionHistoryMessage = null;
+      _devicesMessage = null;
+      _message = null;
+      _isRegistering = false;
+    });
+  }
+
+  void _exitDemoMode() {
+    setState(() {
+      _demoMode = false;
+      _user = null;
+      _subscription = null;
+      _subscriptionHistory = [];
+      _devices = [];
+      _subscriptionMessage = null;
+      _subscriptionHistoryMessage = null;
+      _devicesMessage = null;
+      _message = null;
+    });
   }
 
   Future<void> _loadAccount() async {
@@ -792,6 +830,7 @@ class _ClientHomeState extends State<ClientHome> {
     }
     if (!mounted) return;
     setState(() {
+      _demoMode = false;
       _token = null;
       _user = null;
       _subscription = null;
@@ -824,15 +863,21 @@ class _ClientHomeState extends State<ClientHome> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('VPN 客户端'),
+        title: Text(_demoMode ? 'VPN 客户端 · 演示模式' : 'VPN 客户端'),
         actions: [
-          if (_token != null)
+          if (_demoMode)
+            IconButton(
+              tooltip: '退出演示模式',
+              onPressed: _exitDemoMode,
+              icon: const Icon(Icons.close),
+            )
+          else if (_token != null)
             IconButton(
               tooltip: '刷新',
               onPressed: _busy ? null : _loadAccount,
               icon: const Icon(Icons.refresh),
             ),
-          if (_token != null)
+          if (!_demoMode && _token != null)
             IconButton(
               tooltip: '退出登录',
               onPressed: () => _logout(),
@@ -854,7 +899,12 @@ class _ClientHomeState extends State<ClientHome> {
                     child: Text(_message!),
                   ),
                 ),
-              if (_token == null) _buildLoginForm() else _buildAccount(),
+              if (_demoMode)
+                _buildAccount()
+              else if (_token == null)
+                _buildLoginForm()
+              else
+                _buildAccount(),
             ],
           ),
         ),
@@ -930,6 +980,20 @@ class _ClientHomeState extends State<ClientHome> {
                     },
               child: Text(_isRegistering ? '已有账号？返回登录' : '没有账号？使用邀请口令注册'),
             ),
+            const Divider(height: 28),
+            OutlinedButton.icon(
+              onPressed: _busy ? null : _startDemoMode,
+              icon: const Icon(Icons.visibility_outlined),
+              label: const Text('进入演示模式'),
+            ),
+            const Padding(
+              padding: EdgeInsets.only(top: 8),
+              child: Text(
+                '使用本地虚构数据；不会登录、连接 API 或修改账号。',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.grey),
+              ),
+            ),
           ],
         ),
       ),
@@ -941,6 +1005,18 @@ class _ClientHomeState extends State<ClientHome> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        if (_demoMode) ...[
+          Card(
+            color: Theme.of(context).colorScheme.secondaryContainer,
+            child: const ListTile(
+              leading: Icon(Icons.science_outlined),
+              title: Text('演示模式 · 虚构数据'),
+              subtitle: Text('所有操作均为只读预览，不会连接服务或保存会话。'),
+            ),
+          ),
+          _buildDemoConnectionCard(),
+          _buildDemoNodesCard(),
+        ],
         Card(
           child: ListTile(
             leading: const Icon(Icons.account_circle),
@@ -948,22 +1024,24 @@ class _ClientHomeState extends State<ClientHome> {
             subtitle: Text('用户 ID：${_user?['id'] ?? '—'}'),
           ),
         ),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: OutlinedButton.icon(
-            onPressed: _busy ? null : _changePassword,
-            icon: const Icon(Icons.lock_reset),
-            label: const Text('修改密码'),
+        if (!_demoMode)
+          Align(
+            alignment: Alignment.centerLeft,
+            child: OutlinedButton.icon(
+              onPressed: _busy ? null : _changePassword,
+              icon: const Icon(Icons.lock_reset),
+              label: const Text('修改密码'),
+            ),
           ),
-        ),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: OutlinedButton.icon(
-            onPressed: _busy ? null : _revokeAllSessions,
-            icon: const Icon(Icons.devices_other),
-            label: const Text('退出所有设备'),
+        if (!_demoMode)
+          Align(
+            alignment: Alignment.centerLeft,
+            child: OutlinedButton.icon(
+              onPressed: _busy ? null : _revokeAllSessions,
+              icon: const Icon(Icons.devices_other),
+              label: const Text('退出所有设备'),
+            ),
           ),
-        ),
         Card(
           child: Padding(
             padding: const EdgeInsets.all(16),
@@ -984,16 +1062,18 @@ class _ClientHomeState extends State<ClientHome> {
               children: [
                 Text('我的设备', style: Theme.of(context).textTheme.titleLarge),
                 const SizedBox(height: 8),
-                FilledButton.icon(
-                  onPressed: _busy ? null : _registerDevice,
-                  icon: const Icon(Icons.add),
-                  label: const Text('注册此设备'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: _busy ? null : _retryPendingRegistrations,
-                  icon: const Icon(Icons.sync),
-                  label: const Text('重试待处理注册'),
-                ),
+                if (!_demoMode) ...[
+                  FilledButton.icon(
+                    onPressed: _busy ? null : _registerDevice,
+                    icon: const Icon(Icons.add),
+                    label: const Text('注册此设备'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _busy ? null : _retryPendingRegistrations,
+                    icon: const Icon(Icons.sync),
+                    label: const Text('重试待处理注册'),
+                  ),
+                ],
                 const SizedBox(height: 8),
                 if (_devicesMessage != null)
                   Text(
@@ -1016,6 +1096,59 @@ class _ClientHomeState extends State<ClientHome> {
           ),
         ),
       ],
+    );
+  }
+
+  Widget _buildDemoConnectionCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          children: [
+            const Icon(Icons.shield_outlined, size: 42, color: Colors.indigo),
+            const SizedBox(height: 8),
+            Text('尚未连接', style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(height: 4),
+            const Text('此桌面演示不会建立 VPN 隧道或传输流量。'),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: null,
+              icon: const Icon(Icons.power_settings_new),
+              label: const Text('连接功能未启用'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDemoNodesCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('演示节点', style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(height: 8),
+            const ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.dns_outlined),
+              title: Text('演示节点 A'),
+              subtitle: Text('示例区域 · 健康状态仅作 UI 示例'),
+              trailing: Chip(label: Text('在线')),
+            ),
+            const Divider(height: 1),
+            const ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.dns_outlined),
+              title: Text('演示节点 B'),
+              subtitle: Text('示例区域 · 不会建立连接'),
+              trailing: Chip(label: Text('维护中')),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -1104,7 +1237,7 @@ class _ClientHomeState extends State<ClientHome> {
       leading: Icon(revoked ? Icons.devices : Icons.phone_android),
       title: Text(name),
       subtitle: Text('$platform · ${revoked ? '已撤销' : '有效'}'),
-      trailing: revoked
+      trailing: (_demoMode || revoked)
           ? null
           : Wrap(
               spacing: 4,

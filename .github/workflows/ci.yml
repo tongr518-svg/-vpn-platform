@@ -93,3 +93,37 @@ jobs:
 
       - name: Test
         run: flutter test
+
+  windows-build:
+    name: Windows desktop build
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: client
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Windows runner
+        run: flutter create --platforms=windows --project-name vpn_platform_client .
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build Windows desktop client
+        run: flutter build windows --release
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpn-client-windows
+          path: client/build/windows/x64/runner/Release/
+          if-no-files-found: error
+          retention-days: 7
