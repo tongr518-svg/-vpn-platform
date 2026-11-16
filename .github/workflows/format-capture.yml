@@ -17,6 +17,10 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Get dependencies
+        working-directory: client
+        run: flutter pub get
+
       - name: Format client source
         working-directory: client
         run: dart format lib test
